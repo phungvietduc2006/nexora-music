@@ -27,8 +27,8 @@ import "dotenv/config";
 // --- WEB SERVER KEEP ALIVE 24/7 ---
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.get("/", (req, res) => res.send("JOCKIE STYLE MUSIC BOT IS ONLINE 24/7!"));
-app.listen(PORT, () => console.log(`🌐 Web Server active on port ${PORT}`));
+app.get("/", (req, res) => res.send("NEXORA MUSIC VIP 24/7 is Running!"));
+app.listen(PORT, () => console.log(`🌐 Web Server running on port ${PORT}`));
 
 const client = new Client({
   intents: [
@@ -39,7 +39,7 @@ const client = new Client({
   ],
 });
 
-// --- CẤU HÌNH PLAYERMANAGER TỐI ƯU BỘ ĐỆM ÂM THANH CHỐNG LAG ---
+// --- CẤU HÌNH TỐI ƯU BỘ ĐỆM ÂM THANH CHỐNG GIẬT KHỰNG ---
 new PlayerManager({
   plugins: [
     new YouTubePlugin(),
@@ -59,6 +59,8 @@ new PlayerManager({
 const manager = getManager();
 const PREFIX = process.env.PREFIX || "!";
 const EPHEMERAL = MessageFlags.Ephemeral;
+
+const ADMIN_USER_IDS = ["1073520375285166100"];
 
 // --- HÀM GIẢI MÃ LINK SOUNDCLOUD RÚT GỌN (on.soundcloud.com) ---
 async function resolveQuery(query) {
@@ -106,6 +108,20 @@ const commands = [
   new SlashCommandBuilder().setName("shuffle").setDescription("Trộn bài hát trong hàng chờ"),
 ].map((cmd) => cmd.toJSON());
 
+function resolveUserMention(req, fallbackId) {
+  const pick = (v) => {
+    if (!v) return null;
+    if (typeof v === "string") return `<@${v}>`;
+    if (typeof v === "object") {
+      const id = v.id || v.userId || v.user?.id;
+      if (id) return `<@${id}>`;
+      if (v.username) return `**${v.username}**`;
+    }
+    return null;
+  };
+  return pick(req) || pick(fallbackId) || "Không xác định";
+}
+
 function formatDuration(sec) {
   const n = Number(sec);
   if (!n || n <= 0) return "Live";
@@ -131,7 +147,25 @@ function getAllQueueTracks(player) {
   return list;
 }
 
-// --- GIAO DIỆN HÀNG CHỜ KÈM MENU CHỌN TRANG + MENU CHỌN BÀI HÁT TỨC THÌ ---
+// --- TẠO 4 NÚT ĐIỀU KHIỂN BÀI HÁT ---
+function createMusicControls() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("music_pause").setLabel("⏸ Pause/Resume").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("music_skip").setLabel("⏭ Bỏ qua").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("music_queue").setLabel("📜 Hàng chờ").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("music_stop").setLabel("⏹ Dừng").setStyle(ButtonStyle.Danger)
+  );
+}
+
+async function clearControls(player) {
+  const msg = player?.metadata?.controlMessage;
+  if (msg) {
+    await msg.edit({ components: [] }).catch(() => {});
+    player.metadata.controlMessage = null;
+  }
+}
+
+// --- GIAO DIỆN HÀNG CHỜ KÈM MENU CHỌN TRANG & CHỌN BÀI HÁT TRỰC TIẾP ---
 function buildQueuePage(player, page = 1, pageSize = 10) {
   const tracks = getAllQueueTracks(player);
   const totalTracks = tracks.length;
@@ -170,7 +204,7 @@ function buildQueuePage(player, page = 1, pageSize = 10) {
 
   const componentsArray = [buttons];
 
-  // 2. Menu chọn bài hát trực tiếp (Select Track) từ trang hiện tại
+  // 2. Menu chọn bài hát phát ngay
   if (pageTracks.length > 0) {
     const trackSelectMenu = new StringSelectMenuBuilder()
       .setCustomId("q_play_track_menu")
@@ -189,7 +223,7 @@ function buildQueuePage(player, page = 1, pageSize = 10) {
     componentsArray.push(new ActionRowBuilder().addComponents(trackSelectMenu));
   }
 
-  // 3. Menu thả xuống chọn trang nhanh (Jump Page)
+  // 3. Menu chọn trang nhanh
   if (totalPages > 1) {
     const pageSelectMenu = new StringSelectMenuBuilder()
       .setCustomId("q_jump_menu")
@@ -222,6 +256,7 @@ async function getOrCreatePlayer(guildId, channel, userId) {
   }
   if (!player.metadata) player.metadata = {};
   player.metadata.channel = channel;
+  player.metadata.lastRequesterId = userId;
   return player;
 }
 
@@ -230,6 +265,12 @@ async function enqueue({ guildId, textChannel, voiceChannel, userId, query }) {
   const player = await getOrCreatePlayer(guildId, textChannel, userId);
   if (!player.connection) await player.connect(voiceChannel);
   return player.play(finalQuery, userId);
+}
+
+async function stopAndLeave(player) {
+  await clearControls(player);
+  await player.stop();
+  await player.destroy();
 }
 
 async function skipToPosition(player, position) {
@@ -244,19 +285,39 @@ async function skipToPosition(player, position) {
   return true;
 }
 
+// --- TỰ ĐỘNG GỬI BẢNG ĐIỀU KHIỂN KHI BÀI HÁT BẮT ĐẦU PHÁT ---
 manager.on("trackStart", async (player, track) => {
   const channel = player.metadata?.channel;
   if (!channel) return;
 
   try {
-    const embed = new EmbedBuilder()
-      .setColor("#ff5500")
-      .setDescription(`🟠 **Started playing** [${track.title}](${track.url || "#"})`);
+    await clearControls(player);
+    const userMention = resolveUserMention(track.requestedBy, player.metadata?.lastRequesterId);
 
-    await channel.send({ embeds: [embed] });
+    const embed = new EmbedBuilder()
+      .setColor("#5865F2")
+      .setTitle("🎵 Đang Phát Bài Hát Mới")
+      .setDescription(track.url ? `[**${track.title}**](${track.url})` : `**${track.title}**`)
+      .addFields(
+        { name: "⏱️ Thời lượng", value: formatDuration(track.duration), inline: true },
+        { name: "🔊 Âm lượng", value: `${player.volume || 80}%`, inline: true },
+        { name: "👤 Yêu cầu bởi", value: userMention, inline: true }
+      )
+      .setThumbnail(track.thumbnail || null)
+      .setFooter({ text: "Nexora Music VIP" });
+
+    player.metadata.controlMessage = await channel.send({
+      embeds: [embed],
+      components: [createMusicControls()],
+    });
   } catch (err) {
     console.error("[trackStart Error]", err);
   }
+});
+
+manager.on("queueEnd", async (player) => {
+  await clearControls(player);
+  player.metadata?.channel?.send("✅ Đã phát xong danh sách chờ!").catch(() => {});
 });
 
 // --- PREFIX COMMANDS ---
@@ -287,6 +348,7 @@ client.on("messageCreate", async (message) => {
         query: rawQuery,
       });
       if (!ok) return message.reply("❌ Không tìm thấy kết quả hợp lệ.");
+      return message.reply(`🔍 Đã thêm bài hát vào hàng chờ!`);
     }
 
     if (command === "skipto") {
@@ -304,6 +366,13 @@ client.on("messageCreate", async (message) => {
       if (!player || !player.currentTrack) return message.reply("❌ Không có bài đang phát!");
       await player.skip();
       return message.reply("⏭️ Đã chuyển bài!");
+    }
+
+    if (command === "stop") {
+      const player = getPlayer(message.guild.id);
+      if (!player) return message.reply("❌ Bot không trong kênh thoại!");
+      await stopAndLeave(player);
+      return message.reply("⏹️ Đã dừng nhạc.");
     }
   } catch (err) {
     console.error(`[Prefix error: ${command}]`, err);
@@ -347,33 +416,39 @@ client.on("interactionCreate", async (interaction) => {
         if (!success) return interaction.reply({ content: "❌ Vị trí không hợp lệ!", flags: EPHEMERAL });
         return interaction.reply(`⏩ Đã nhảy thẳng tới bài số **${pos}**!`);
       }
+
+      if (commandName === "stop") {
+        const player = getPlayer(interaction.guildId);
+        if (!player) return interaction.reply({ content: "❌ Bot không trong phòng thoại!", flags: EPHEMERAL });
+        await stopAndLeave(player);
+        return interaction.reply("⏹️ Đã dừng nhạc.");
+      }
     } catch (err) {
       console.error(`[Slash command error: ${commandName}]`, err);
     }
     return;
   }
 
+  // --- XỬ LÝ NÚT BẤM VÀ CÁC MENU THẢ XUỐNG ---
   if (interaction.isButton() || interaction.isStringSelectMenu()) {
     const player = getPlayer(interaction.guildId);
     if (!player) return interaction.reply({ content: "❌ Bot không ở trong kênh thoại!", flags: EPHEMERAL });
 
     try {
-      // 1. Xử lý chọn phát bài hát trực tiếp từ Menu
+      // 1. Phát trực tiếp 1 bài từ Menu chọn bài
       if (interaction.isStringSelectMenu() && interaction.customId === "q_play_track_menu") {
-        const selectedValue = interaction.values[0]; // dạng "trackpos_15"
-        const targetPos = parseInt(selectedValue.split("_")[1]) || 1;
-        
+        const targetPos = parseInt(interaction.values[0].split("_")[1]) || 1;
         await skipToPosition(player, targetPos);
         return interaction.reply({ content: `⏩ Đã phát ngay bài hát số **${targetPos}**!`, flags: EPHEMERAL });
       }
 
-      // 2. Xử lý Menu chọn trang
+      // 2. Chuyển trang queue từ Menu chọn trang
       if (interaction.isStringSelectMenu() && interaction.customId === "q_jump_menu") {
         const targetPage = parseInt(interaction.values[0].split("_")[1]) || 1;
         return interaction.update(buildQueuePage(player, targetPage));
       }
 
-      // 3. Xử lý Nút bấm điều hướng << < > >>
+      // 3. Nút phân trang queue (<< < > >>)
       if (interaction.isButton() && interaction.customId.startsWith("q_")) {
         const parts = interaction.customId.split("_");
         const action = parts[1];
@@ -389,6 +464,23 @@ client.on("interactionCreate", async (interaction) => {
 
         return interaction.update(buildQueuePage(player, currentPage));
       }
+
+      // 4. Nút bấm điều khiển nhạc (Pause, Skip, Queue, Stop)
+      if (interaction.isButton() && interaction.customId.startsWith("music_")) {
+        const id = interaction.customId;
+        if (id === "music_queue") {
+          return interaction.reply({ ...buildQueuePage(player, 1), flags: EPHEMERAL });
+        }
+
+        await interaction.deferUpdate().catch(() => {});
+        if (id === "music_pause") {
+          if (!player.pause()) player.resume();
+        } else if (id === "music_skip") {
+          await player.skip();
+        } else if (id === "music_stop") {
+          await stopAndLeave(player);
+        }
+      }
     } catch (err) {
       console.error("[Interaction error]", err);
     }
@@ -396,7 +488,7 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 client.once(Events.ClientReady, async () => {
-  console.log(`✅ Jockie Style Bot sẵn sàng: ${client.user.tag}`);
+  console.log(`✅ NEXORA MUSIC VIP sẵn sàng: ${client.user.tag}`);
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   try {
     await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
