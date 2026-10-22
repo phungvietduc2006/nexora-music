@@ -13,7 +13,7 @@ import {
   MessageFlags,
   Events,
 } from "discord.js";
-import { PlayerManager, getManager, getPlayer } from "ziplayer";
+import { PlayerManager } from "ziplayer";
 import {
   YouTubePlugin,
   SoundCloudPlugin,
@@ -22,14 +22,50 @@ import {
   AttachmentsPlugin,
 } from "@ziplayer/plugin";
 import express from "express";
-import os from "os";
 import "dotenv/config";
 
-// --- WEB SERVER KEEP ALIVE 24/7 ---
+// ============================================================
+// NEXORA MUSIC VIP — optimized bot entry point
+// Requires Node.js 20+ and an ESM project ("type": "module").
+// ============================================================
+
+const TOKEN = process.env.DISCORD_TOKEN?.trim();
+const PREFIX = process.env.PREFIX || "!";
+const PORT = Number(process.env.PORT) || 3000;
+const EPHEMERAL = MessageFlags.Ephemeral;
+const QUEUE_PAGE_SIZE = 10;
+const MAX_TITLE_LENGTH = 180;
+
+// Put comma-separated Discord user IDs in ADMIN_USER_IDS in the environment.
+// The existing ID is retained as a fallback so the current configuration keeps working.
+const ADMIN_USER_IDS = new Set(
+  (process.env.ADMIN_USER_IDS || "1073520375285166100")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean),
+);
+
+function isAdmin(userId) {
+  return ADMIN_USER_IDS.has(userId);
+}
+
+// Health-check endpoint for hosting providers. This does not itself guarantee
+// that a hosting provider's free instance will stay awake 24/7.
 const app = express();
-const PORT = process.env.PORT || 3000;
-app.get("/", (req, res) => res.send("NEXORA MUSIC VIP 24/7 is Running!"));
-app.listen(PORT, () => console.log(`🌐 Web Server running on port ${PORT}`));
+app.disable("x-powered-by");
+app.get("/", (_req, res) => {
+  res.status(200).send("NEXORA MUSIC VIP is running.");
+});
+app.get("/health", (_req, res) => {
+  res.status(200).json({ status: "ok", uptimeSeconds: Math.floor(process.uptime()) });
+});
+
+const webServer = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🌐 Health server listening on port ${PORT}`);
+});
+webServer.on("error", (error) => {
+  console.error("[Web server error]", error);
+});
 
 const client = new Client({
   intents: [
@@ -40,556 +76,870 @@ const client = new Client({
   ],
 });
 
-// --- CẤU HÌNH TỐI ƯU BỘ ĐỆM ÂM THANH CHỐNG GIẬT KHỰNG ---
-new PlayerManager({
+// Register specific matchers (TTS and attachments) before general search plugins.
+// Low-performance mode avoids extra preload/crossfade work on small cloud instances.
+const manager = new PlayerManager({
   plugins: [
+    new TTSPlugin({ defaultLang: "vi" }),
+    new AttachmentsPlugin({ maxFileSize: 25 * 1024 * 1024 }),
     new YouTubePlugin(),
     new SoundCloudPlugin(),
     new SpotifyPlugin(),
-    new TTSPlugin({ defaultLang: "vi" }),
-    new AttachmentsPlugin({ maxFileSize: 25 * 1024 * 1024 }),
   ],
   autoCleanup: true,
-  ytdlOptions: {
-    highWaterMark: 1 << 26,
-    filter: "audioonly",
-    quality: "highestaudio",
-  },
+  cleanupInterval: 120_000,
+  extractorTimeout: 30_000,
+  enableSearchCache: true,
 });
 
-const manager = getManager();
-const PREFIX = process.env.PREFIX || "!";
-const EPHEMERAL = MessageFlags.Ephemeral;
+// --------------------------- Utilities ---------------------------
 
-// Danh sách Discord User ID của Admin
-const ADMIN_USER_IDS = ["1073520375285166100"];
-
-function isAdmin(userId) {
-  return ADMIN_USER_IDS.includes(userId);
-}
-
-// --- HÀM GIẢI MÃ LINK SOUNDCLOUD RÚT GỌN (on.soundcloud.com) ---
-async function resolveQuery(query) {
-  if (typeof query === "string" && query.includes("on.soundcloud.com")) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 4000);
-      
-      const res = await fetch(query, { 
-        method: "HEAD", 
-        redirect: "follow",
-        signal: controller.signal,
-        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-      });
-      clearTimeout(timeoutId);
-      
-      if (res.url && !res.url.includes("on.soundcloud.com")) {
-        return res.url;
-      }
-    } catch (e) {
-      console.error("[SoundCloud Resolve Warning]:", e.message);
-    }
+function ensureUserdata(player) {
+  if (!player.userdata || typeof player.userdata !== "object") {
+    player.userdata = {};
   }
-  return query;
+  return player.userdata;
 }
 
-// --- SLASH COMMANDS DEFINITION ---
+function getPlayerForGuild(guildId) {
+  return manager.get(guildId) ?? null;
+}
+
+function getCurrentTrack(player) {
+  return player?.currentTrack ?? player?.queue?.currentTrack ?? null;
+}
+
+function safeHttpUrl(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function clipText(value, maxLength = MAX_TITLE_LENGTH) {
+  const text = String(value ?? "Không rõ tên").trim() || "Không rõ tên";
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+function escapeMarkdown(value) {
+  return String(value ?? "").replace(/[\\`*_{}\[\]()<>#+\-.!|~]/g, "\\$&");
+}
+
+// ZiPlayer track durations are milliseconds (e.g. 300000 = 5 minutes).
+function formatDuration(durationMs) {
+  const value = Number(durationMs);
+  if (!Number.isFinite(value) || value <= 0) return "LIVE";
+
+  const totalSeconds = Math.floor(value / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const pad = (number) => String(number).padStart(2, "0");
+
+  return hours > 0
+    ? `${hours}:${pad(minutes)}:${pad(seconds)}`
+    : `${minutes}:${pad(seconds)}`;
+}
+
+function resolveUserMention(requester, fallbackId) {
+  const pick = (value) => {
+    if (!value) return null;
+    if (typeof value === "string") return /^\d{17,20}$/.test(value) ? `<@${value}>` : null;
+    if (typeof value === "object") {
+      const id = value.id || value.userId || value.user?.id;
+      if (id && /^\d{17,20}$/.test(String(id))) return `<@${id}>`;
+      if (value.username) return `**${clipText(value.username, 80)}**`;
+    }
+    return null;
+  };
+  return pick(requester) || pick(fallbackId) || "Không xác định";
+}
+
+async function resolveQuery(query) {
+  const input = String(query ?? "").trim();
+  if (!input) return input;
+  if (!input.includes("on.soundcloud.com")) return input;
+
+  let timeoutId;
+  try {
+    const controller = new AbortController();
+    timeoutId = setTimeout(() => controller.abort(), 4_000);
+    const response = await fetch(input, {
+      method: "HEAD",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    const resolvedUrl = safeHttpUrl(response.url);
+    return resolvedUrl && !resolvedUrl.includes("on.soundcloud.com") ? resolvedUrl : input;
+  } catch (error) {
+    console.warn("[SoundCloud resolve warning]", error?.message || error);
+    return input;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
+function getAllQueueTracks(player) {
+  const queue = player?.queue;
+  if (!queue) return [];
+
+  if (typeof queue.toArray === "function") {
+    const tracks = queue.toArray();
+    if (Array.isArray(tracks)) return tracks;
+  }
+  if (Array.isArray(queue.tracks)) return queue.tracks;
+
+  const size = Number(queue.size) || 0;
+  if (typeof queue.getTrack === "function" && size > 0) {
+    const tracks = [];
+    for (let index = 0; index < size; index += 1) {
+      const track = queue.getTrack(index);
+      if (track) tracks.push(track);
+    }
+    return tracks;
+  }
+  return [];
+}
+
+function memberIsInPlayerVoice(member, player) {
+  const memberChannelId = member?.voice?.channelId;
+  const playerChannelId = player?.userdata?.voiceChannelId;
+  return Boolean(memberChannelId && playerChannelId && memberChannelId === playerChannelId);
+}
+
+async function requireSameVoiceForMessage(message, player) {
+  if (memberIsInPlayerVoice(message.member, player)) return true;
+  await message.reply("❌ Bạn cần ở cùng kênh thoại với bot để điều khiển nhạc.").catch(() => {});
+  return false;
+}
+
+async function requireSameVoiceForInteraction(interaction, player) {
+  if (memberIsInPlayerVoice(interaction.member, player)) return true;
+  await interaction.reply({
+    content: "❌ Bạn cần ở cùng kênh thoại với bot để điều khiển nhạc.",
+    flags: EPHEMERAL,
+  }).catch(() => {});
+  return false;
+}
+
+async function sendInteractionError(interaction, message) {
+  const payload = { content: message, flags: EPHEMERAL };
+  try {
+    if (interaction.isChatInputCommand?.() && interaction.deferred) {
+      await interaction.editReply({ content: message });
+    } else if (interaction.replied || interaction.deferred) {
+      await interaction.followUp(payload);
+    } else {
+      await interaction.reply(payload);
+    }
+  } catch {
+    // Interaction may have expired or already been acknowledged.
+  }
+}
+
+function getSafeErrorMessage(error) {
+  if (error?.message === "VOICE_CHANNEL_MISMATCH") {
+    return "❌ Bot đang phát ở kênh thoại khác. Hãy dùng bot trong cùng kênh với người đang nghe.";
+  }
+  return "❌ Có lỗi khi xử lý yêu cầu. Hãy thử lại sau.";
+}
+
+// --------------------------- Slash commands ---------------------------
+
 const commands = [
   new SlashCommandBuilder()
     .setName("play")
-    .setDescription("Phát nhạc từ YouTube, SoundCloud, Spotify")
+    .setDescription("Phát nhạc từ YouTube, SoundCloud hoặc Spotify")
     .addStringOption((option) =>
-      option.setName("query").setDescription("Link hoặc tên bài hát").setRequired(true)
+      option
+        .setName("query")
+        .setDescription("Link hoặc tên bài hát")
+        .setRequired(true)
+        .setMaxLength(500),
     ),
   new SlashCommandBuilder().setName("skip").setDescription("Bỏ qua bài hát hiện tại"),
   new SlashCommandBuilder()
     .setName("skipto")
-    .setDescription("Nhảy thẳng tới vị trí bài hát trong danh sách chờ")
+    .setDescription("Phát bài ở vị trí đã chọn trong hàng chờ")
     .addIntegerOption((option) =>
-      option.setName("position").setDescription("Số thứ tự trong hàng chờ").setRequired(true).setMinValue(1)
+      option
+        .setName("position")
+        .setDescription("Vị trí bài trong hàng chờ, bắt đầu từ 1")
+        .setRequired(true)
+        .setMinValue(1),
     ),
   new SlashCommandBuilder().setName("queue").setDescription("Xem danh sách hàng chờ"),
   new SlashCommandBuilder().setName("stop").setDescription("Dừng nhạc và rời kênh thoại"),
   new SlashCommandBuilder().setName("nowplaying").setDescription("Xem bài hát đang phát"),
-  new SlashCommandBuilder().setName("shuffle").setDescription("Trộn bài hát trong hàng chờ"),
-
-  // HỆ THỐNG LỆNH ADMIN
+  new SlashCommandBuilder().setName("shuffle").setDescription("Trộn bài trong hàng chờ"),
   new SlashCommandBuilder()
     .setName("admin")
-    .setDescription("Hệ thống quản trị Admin VIP")
-    .addSubcommand((s) => s.setName("stats").setDescription("Kiểm tra thông số tài nguyên máy chủ Render"))
-    .addSubcommand((s) => s.setName("clearqueue").setDescription("Xóa toàn bộ bài hát trong hàng chờ"))
-    .addSubcommand((s) => s.setName("forceleave").setDescription("Buộc bot ngắt kết nối và rời phòng")),
-].map((cmd) => cmd.toJSON());
+    .setDescription("Hệ thống quản trị Admin")
+    .addSubcommand((sub) => sub.setName("stats").setDescription("Xem tài nguyên bot"))
+    .addSubcommand((sub) => sub.setName("clearqueue").setDescription("Xóa toàn bộ hàng chờ"))
+    .addSubcommand((sub) => sub.setName("forceleave").setDescription("Buộc bot dừng và rời phòng")),
+].map((command) => command.toJSON());
 
-function resolveUserMention(req, fallbackId) {
-  const pick = (v) => {
-    if (!v) return null;
-    if (typeof v === "string") return `<@${v}>`;
-    if (typeof v === "object") {
-      const id = v.id || v.userId || v.user?.id;
-      if (id) return `<@${id}>`;
-      if (v.username) return `**${v.username}**`;
-    }
-    return null;
-  };
-  return pick(req) || pick(fallbackId) || "Không xác định";
-}
+// --------------------------- Player lifecycle ---------------------------
 
-function formatDuration(sec) {
-  const n = Number(sec);
-  if (!n || n <= 0) return "Live";
-  const pad = (x) => String(x).padStart(2, "0");
-  const h = Math.floor(n / 3600);
-  const m = Math.floor((n / 60) % 60);
-  const s = Math.floor(n % 60);
-  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
-}
+async function getOrCreatePlayer({ guildId, textChannel, voiceChannel, userId }) {
+  let player = getPlayerForGuild(guildId);
 
-function getAllQueueTracks(player) {
-  const q = player.queue;
-  if (!q) return [];
-  if (typeof q.toArray === "function") return q.toArray();
-  if (Array.isArray(q.tracks)) return q.tracks;
-  let list = [];
-  if (typeof q.getTrack === "function") {
-    for (let i = 0; i < (q.size || 0); i++) {
-      const t = q.getTrack(i);
-      if (t) list.push(t);
-    }
-  }
-  return list;
-}
-
-// --- TẠO 4 NÚT ĐIỀU KHIỂN BÀI HÁT ---
-function createMusicControls() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("music_pause").setLabel("⏸ Pause/Resume").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("music_skip").setLabel("⏭ Bỏ qua").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("music_queue").setLabel("📜 Hàng chờ").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("music_stop").setLabel("⏹ Dừng").setStyle(ButtonStyle.Danger)
-  );
-}
-
-async function clearControls(player) {
-  const msg = player?.metadata?.controlMessage;
-  if (msg) {
-    await msg.edit({ components: [] }).catch(() => {});
-    player.metadata.controlMessage = null;
-  }
-}
-
-// --- GIAO DIỆN HÀNG CHỜ KÈM MENU CHỌN TRANG & CHỌN BÀI HÁT TRỰC TIẾP ---
-function buildQueuePage(player, page = 1, pageSize = 10) {
-  const tracks = getAllQueueTracks(player);
-  const totalTracks = tracks.length;
-  const totalPages = Math.ceil(totalTracks / pageSize) || 1;
-  const currentPage = Math.max(1, Math.min(page, totalPages));
-
-  const startIdx = (currentPage - 1) * pageSize;
-  const pageTracks = tracks.slice(startIdx, startIdx + pageSize);
-
-  const current = player.currentTrack;
-  let desc = `**Đang phát:** ${current ? `[${current.title}](${current.url || "#"})` : "Không có"}\n\n`;
-
-  if (pageTracks.length === 0) {
-    desc += "*Hàng chờ trống.*";
-  } else {
-    pageTracks.forEach((t, i) => {
-      const index = startIdx + i + 1;
-      const durationStr = formatDuration(t.duration);
-      desc += `${index}. [${durationStr}] [${t.title}](${t.url || "#"})\n`;
-    });
+  if (
+    player?.userdata?.voiceChannelId &&
+    player.userdata.voiceChannelId !== voiceChannel.id
+  ) {
+    throw new Error("VOICE_CHANNEL_MISMATCH");
   }
 
-  const embed = new EmbedBuilder()
-    .setColor("#2b2d31")
-    .setTitle(`Page ${currentPage}/${totalPages}`)
-    .setDescription(desc)
-    .setFooter({ text: `next page | previous page | go to page <page> | cancel` });
-
-  // 1. Nút điều hướng << < > >>
-  const buttons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`q_first_${currentPage}`).setLabel("<<").setStyle(ButtonStyle.Secondary).setDisabled(currentPage === 1),
-    new ButtonBuilder().setCustomId(`q_prev_${currentPage}`).setLabel("<").setStyle(ButtonStyle.Primary).setDisabled(currentPage === 1),
-    new ButtonBuilder().setCustomId(`q_next_${currentPage}`).setLabel(">").setStyle(ButtonStyle.Primary).setDisabled(currentPage === totalPages),
-    new ButtonBuilder().setCustomId(`q_last_${currentPage}`).setLabel(">>").setStyle(ButtonStyle.Secondary).setDisabled(currentPage === totalPages)
-  );
-
-  const componentsArray = [buttons];
-
-  // 2. Menu chọn bài hát phát ngay
-  if (pageTracks.length > 0) {
-    const trackSelectMenu = new StringSelectMenuBuilder()
-      .setCustomId("q_play_track_menu")
-      .setPlaceholder("🎵 Chọn phát ngay 1 bài trong trang này...");
-
-    const trackOptions = pageTracks.map((t, i) => {
-      const realIndex = startIdx + i + 1;
-      const titleShort = t.title.length > 50 ? t.title.substring(0, 47) + "..." : t.title;
-      return new StringSelectMenuOptionBuilder()
-        .setLabel(`${realIndex}. ${titleShort}`)
-        .setValue(`trackpos_${realIndex}`)
-        .setDescription(`Thời lượng: ${formatDuration(t.duration)}`);
-    });
-
-    trackSelectMenu.addOptions(trackOptions);
-    componentsArray.push(new ActionRowBuilder().addComponents(trackSelectMenu));
-  }
-
-  // 3. Menu chọn trang nhanh
-  if (totalPages > 1) {
-    const pageSelectMenu = new StringSelectMenuBuilder()
-      .setCustomId("q_jump_menu")
-      .setPlaceholder("Đưa ra lựa chọn");
-
-    const pageOptions = [];
-    for (let i = 1; i <= Math.min(25, totalPages); i++) {
-      pageOptions.push(
-        new StringSelectMenuOptionBuilder()
-          .setLabel(`Trang ${i}`)
-          .setValue(`page_${i}`)
-          .setDefault(i === currentPage)
-      );
-    }
-    pageSelectMenu.addOptions(pageOptions);
-    componentsArray.push(new ActionRowBuilder().addComponents(pageSelectMenu));
-  }
-
-  return { embeds: [embed], components: componentsArray };
-}
-
-async function getOrCreatePlayer(guildId, channel, userId) {
-  let player = getPlayer(guildId);
   if (!player) {
     player = await manager.create(guildId, {
       leaveOnEnd: true,
       leaveOnEmpty: true,
+      pauseOnEmpty: false,
+      selfDeaf: true,
       volume: 80,
+      lowPerformance: true,
+      preload: { enabled: false },
+      crossfade: { enabled: false },
+      userdata: {
+        channel: textChannel,
+        lastRequesterId: userId,
+        voiceChannelId: voiceChannel.id,
+        paused: false,
+        suppressQueueEnd: false,
+      },
     });
   }
-  if (!player.metadata) player.metadata = {};
-  player.metadata.channel = channel;
-  player.metadata.lastRequesterId = userId;
+
+  const userdata = ensureUserdata(player);
+  userdata.channel = textChannel;
+  userdata.lastRequesterId = userId;
+  userdata.voiceChannelId = voiceChannel.id;
+  if (typeof userdata.paused !== "boolean") userdata.paused = false;
+  if (typeof userdata.suppressQueueEnd !== "boolean") userdata.suppressQueueEnd = false;
+
+  if (!player.connection) {
+    await player.connect(voiceChannel);
+    userdata.voiceChannelId = voiceChannel.id;
+  }
   return player;
 }
 
 async function enqueue({ guildId, textChannel, voiceChannel, userId, query }) {
   const finalQuery = await resolveQuery(query);
-  const player = await getOrCreatePlayer(guildId, textChannel, userId);
-  if (!player.connection) await player.connect(voiceChannel);
-  return player.play(finalQuery, userId);
+  if (!finalQuery) return false;
+
+  const player = await getOrCreatePlayer({ guildId, textChannel, voiceChannel, userId });
+  // Some ZiPlayer versions return undefined on success. Only an explicit false
+  // is considered a failed result; thrown errors are handled by the caller.
+  const result = await player.play(finalQuery, userId);
+  return result !== false;
+}
+
+async function clearControls(player) {
+  const userdata = player?.userdata;
+  const message = userdata?.controlMessage;
+  if (!message) return;
+
+  await message.edit({ components: [] }).catch(() => {});
+  userdata.controlMessage = null;
 }
 
 async function stopAndLeave(player) {
+  if (!player) return;
+  const userdata = ensureUserdata(player);
+  // Prevent stop-triggered queueEnd events from claiming the queue finished normally.
+  userdata.suppressQueueEnd = true;
   await clearControls(player);
-  await player.stop();
-  await player.destroy();
+
+  try {
+    if (typeof player.queue?.clear === "function") player.queue.clear();
+    if (typeof player.stop === "function") await player.stop();
+  } finally {
+    if (typeof player.destroy === "function") await player.destroy();
+  }
 }
 
 async function skipToPosition(player, position) {
   const tracks = getAllQueueTracks(player);
-  if (position < 1 || position > tracks.length) return false;
-  if (typeof player.queue.remove === "function") {
-    for (let i = 0; i < position - 1; i++) {
-      player.queue.remove(0);
-    }
+  if (!Number.isInteger(position) || position < 1 || position > tracks.length) return false;
+  if (typeof player.queue?.remove !== "function" || typeof player.skip !== "function") return false;
+  if (!getCurrentTrack(player)) return false;
+
+  // Queue positions are 1-based in the UI. Remove tracks before the target,
+  // then skip the current track so the selected item becomes the next one.
+  for (let index = 1; index < position; index += 1) {
+    player.queue.remove(0);
   }
   await player.skip();
   return true;
 }
 
-// --- TỰ ĐỘNG GỬI BẢNG ĐIỀU KHIỂN KHI BÀI HÁT BẮT ĐẦU PHÁT ---
+// --------------------------- Queue UI ---------------------------
+
+function createMusicControls() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("music_pause")
+      .setLabel("⏯ Tạm dừng / Tiếp tục")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("music_skip")
+      .setLabel("⏭ Bỏ qua")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId("music_queue")
+      .setLabel("📜 Hàng chờ")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId("music_stop")
+      .setLabel("⏹ Dừng")
+      .setStyle(ButtonStyle.Danger),
+  );
+}
+
+function buildNowPlayingEmbed(player, track = getCurrentTrack(player)) {
+  if (!track) {
+    return new EmbedBuilder()
+      .setColor("#2b2d31")
+      .setTitle("🎵 Hiện không có bài hát nào đang phát.");
+  }
+
+  const url = safeHttpUrl(track.url);
+  const description = [
+    `**${escapeMarkdown(clipText(track.title))}**`,
+    url ? `<${url}>` : null,
+  ].filter(Boolean).join("\n");
+
+  const embed = new EmbedBuilder()
+    .setColor("#5865F2")
+    .setTitle("🎵 Đang phát")
+    .setDescription(description)
+    .addFields(
+      { name: "⏱️ Thời lượng", value: formatDuration(track.duration), inline: true },
+      { name: "🔊 Âm lượng", value: `${player.volume ?? 80}%`, inline: true },
+      {
+        name: "👤 Yêu cầu bởi",
+        value: resolveUserMention(track.requestedBy, player.userdata?.lastRequesterId),
+        inline: true,
+      },
+    )
+    .setFooter({ text: "Nexora Music VIP" });
+
+  const thumbnail = safeHttpUrl(track.thumbnail);
+  if (thumbnail) embed.setThumbnail(thumbnail);
+  return embed;
+}
+
+function buildQueuePage(player, page = 1, pageSize = QUEUE_PAGE_SIZE) {
+  const tracks = getAllQueueTracks(player);
+  const totalPages = Math.max(1, Math.ceil(tracks.length / pageSize));
+  const currentPage = Math.max(1, Math.min(Math.floor(Number(page) || 1), totalPages));
+  const startIndex = (currentPage - 1) * pageSize;
+  const pageTracks = tracks.slice(startIndex, startIndex + pageSize);
+  const current = getCurrentTrack(player);
+
+  let description = current
+    ? `**Đang phát:** ${escapeMarkdown(clipText(current.title, 220))}\n\n`
+    : "**Đang phát:** Không có\n\n";
+
+  if (pageTracks.length === 0) {
+    description += "*Hàng chờ trống.*";
+  } else {
+    for (let index = 0; index < pageTracks.length; index += 1) {
+      const track = pageTracks[index];
+      const queuePosition = startIndex + index + 1;
+      const title = escapeMarkdown(clipText(track.title, 180));
+      const url = safeHttpUrl(track.url);
+      description += `${queuePosition}. \`${formatDuration(track.duration)}\` ${title}`;
+      if (url) description += ` — <${url}>`;
+      description += "\n";
+    }
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor("#2b2d31")
+    .setTitle(`📜 Hàng chờ · Trang ${currentPage}/${totalPages}`)
+    .setDescription(description.slice(0, 4000))
+    .setFooter({ text: `${tracks.length} bài trong hàng chờ · Chọn bài để phát tiếp theo` });
+
+  const navigationButtons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`q_first_${currentPage}`)
+      .setLabel("≪")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(currentPage === 1),
+    new ButtonBuilder()
+      .setCustomId(`q_prev_${currentPage}`)
+      .setLabel("‹")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(currentPage === 1),
+    new ButtonBuilder()
+      .setCustomId(`q_next_${currentPage}`)
+      .setLabel("›")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(currentPage === totalPages),
+    new ButtonBuilder()
+      .setCustomId(`q_last_${currentPage}`)
+      .setLabel("≫")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(currentPage === totalPages),
+  );
+
+  const components = [navigationButtons];
+
+  if (pageTracks.length > 0) {
+    const trackMenu = new StringSelectMenuBuilder()
+      .setCustomId("q_play_track_menu")
+      .setPlaceholder("🎵 Chọn bài muốn phát tiếp theo")
+      .addOptions(
+        pageTracks.map((track, index) => {
+          const position = startIndex + index + 1;
+          const labelTitle = clipText(track.title, 85);
+          return new StringSelectMenuOptionBuilder()
+            .setLabel(clipText(`${position}. ${labelTitle}`, 100))
+            .setValue(`trackpos_${position}`)
+            .setDescription(`Thời lượng: ${formatDuration(track.duration)}`);
+        }),
+      );
+    components.push(new ActionRowBuilder().addComponents(trackMenu));
+  }
+
+  // A Discord select menu can contain at most 25 options. Center the visible
+  // window around the current page so long queues remain navigable.
+  if (totalPages > 1) {
+    const firstVisiblePage = Math.max(1, Math.min(currentPage - 12, totalPages - 24));
+    const lastVisiblePage = Math.min(totalPages, firstVisiblePage + 24);
+    const pageOptions = [];
+
+    for (let pageNumber = firstVisiblePage; pageNumber <= lastVisiblePage; pageNumber += 1) {
+      pageOptions.push(
+        new StringSelectMenuOptionBuilder()
+          .setLabel(`Trang ${pageNumber}`)
+          .setValue(`page_${pageNumber}`)
+          .setDefault(pageNumber === currentPage),
+      );
+    }
+
+    const pageMenu = new StringSelectMenuBuilder()
+      .setCustomId("q_jump_menu")
+      .setPlaceholder("Chuyển nhanh đến trang…")
+      .addOptions(pageOptions);
+    components.push(new ActionRowBuilder().addComponents(pageMenu));
+  }
+
+  return { embeds: [embed], components };
+}
+
+// --------------------------- ZiPlayer events ---------------------------
+
 manager.on("trackStart", async (player, track) => {
-  const channel = player.metadata?.channel;
-  if (!channel) return;
+  const channel = player?.userdata?.channel;
+  if (!channel?.send) return;
 
   try {
     await clearControls(player);
-    const userMention = resolveUserMention(track.requestedBy, player.metadata?.lastRequesterId);
-
-    const embed = new EmbedBuilder()
-      .setColor("#5865F2")
-      .setTitle("🎵 Đang Phát Bài Hát Mới")
-      .setDescription(track.url ? `[**${track.title}**](${track.url})` : `**${track.title}**`)
-      .addFields(
-        { name: "⏱️ Thời lượng", value: formatDuration(track.duration), inline: true },
-        { name: "🔊 Âm lượng", value: `${player.volume || 80}%`, inline: true },
-        { name: "👤 Yêu cầu bởi", value: userMention, inline: true }
-      )
-      .setThumbnail(track.thumbnail || null)
-      .setFooter({ text: "Nexora Music VIP" });
-
-    player.metadata.controlMessage = await channel.send({
-      embeds: [embed],
-      components: [createMusicControls()],
-    });
-  } catch (err) {
-    console.error("[trackStart Error]", err);
+    const embed = buildNowPlayingEmbed(player, track);
+    const message = await channel.send({ embeds: [embed], components: [createMusicControls()] });
+    ensureUserdata(player).controlMessage = message;
+    ensureUserdata(player).paused = false;
+  } catch (error) {
+    console.error("[trackStart error]", error);
   }
 });
 
 manager.on("queueEnd", async (player) => {
+  if (player?.userdata?.suppressQueueEnd) return;
   await clearControls(player);
-  player.metadata?.channel?.send("✅ Đã phát xong danh sách chờ!").catch(() => {});
+  const channel = player?.userdata?.channel;
+  if (channel?.send) {
+    await channel.send("✅ Đã phát xong danh sách chờ!").catch(() => {});
+  }
 });
 
-// --- PREFIX COMMANDS ---
-client.on("messageCreate", async (message) => {
+manager.on("playerPause", (player) => {
+  ensureUserdata(player).paused = true;
+});
+
+manager.on("playerResume", (player) => {
+  ensureUserdata(player).paused = false;
+});
+
+manager.on("playerError", (player, error, track) => {
+  console.error("[ZiPlayer error]", error);
+  const channel = player?.userdata?.channel;
+  if (channel?.send) {
+    const title = track?.title ? ` (${clipText(track.title, 80)})` : "";
+    channel.send(`⚠️ Có lỗi khi phát nhạc${title}. Hãy thử lại hoặc chọn bài khác.`).catch(() => {});
+  }
+});
+
+// --------------------------- Prefix commands ---------------------------
+
+async function handlePrefixCommand(message) {
   if (message.author.bot || !message.guild || !message.content.startsWith(PREFIX)) return;
 
-  const args = message.content.slice(PREFIX.length).trim().split(/ +/g);
-  const command = args.shift()?.toLowerCase();
+  const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
+  const command = (args.shift() || "").toLowerCase();
+  if (!command) return;
+
   const voiceChannel = message.member?.voice?.channel;
 
   try {
-    if (command === "play" || command === "p" || command === "m!q" || command === "q" || command === "queue") {
-      if (command === "m!q" || command === "q" || command === "queue") {
-        const player = getPlayer(message.guild.id);
-        if (!player || !player.currentTrack) return message.reply("🎶 Hàng chờ đang trống.");
-        return message.reply(buildQueuePage(player, 1));
-      }
-
-      if (!voiceChannel) return message.reply("❌ Bạn phải vào một kênh thoại trước!");
-      const rawQuery = args.join(" ");
-      if (!rawQuery) return message.reply("❌ Vui lòng nhập link hoặc tên bài!");
+    if (["play", "p"].includes(command)) {
+      if (!voiceChannel) return message.reply("❌ Bạn cần vào kênh thoại trước khi phát nhạc.");
+      const query = args.join(" ").trim();
+      if (!query) return message.reply(`❌ Cách dùng: \`${PREFIX}play tên bài hát hoặc link\``);
 
       const ok = await enqueue({
         guildId: message.guild.id,
         textChannel: message.channel,
         voiceChannel,
         userId: message.author.id,
-        query: rawQuery,
+        query,
       });
-      if (!ok) return message.reply("❌ Không tìm thấy kết quả hợp lệ.");
-      return message.reply(`🔍 Đã thêm bài hát vào hàng chờ!`);
+      return message.reply(ok ? "🔍 Đã thêm yêu cầu vào trình phát!" : "❌ Không tìm thấy bài hát phù hợp.");
     }
 
-    if (command === "skipto") {
-      const player = getPlayer(message.guild.id);
-      if (!player || !player.currentTrack) return message.reply("❌ Hàng chờ trống!");
-      const pos = parseInt(args[0]);
-      if (isNaN(pos)) return message.reply("❌ Vui lòng nhập số vị trí hợp lệ!");
-      const success = await skipToPosition(player, pos);
-      if (!success) return message.reply("❌ Vị trí không hợp lệ!");
-      return message.reply(`⏩ Đã chuyển đến bài số **${pos}**!`);
+    if (["queue", "q"].includes(command)) {
+      const player = getPlayerForGuild(message.guild.id);
+      if (!player) return message.reply("🎶 Hàng chờ đang trống.");
+      return message.reply(buildQueuePage(player, 1));
     }
 
-    if (command === "skip" || command === "s") {
-      const player = getPlayer(message.guild.id);
-      if (!player || !player.currentTrack) return message.reply("❌ Không có bài đang phát!");
+    if (["nowplaying", "np"].includes(command)) {
+      const player = getPlayerForGuild(message.guild.id);
+      if (!player || !getCurrentTrack(player)) return message.reply("🎶 Hiện không có bài hát nào đang phát.");
+      return message.reply({ embeds: [buildNowPlayingEmbed(player)] });
+    }
+
+    if (["skip", "s"].includes(command)) {
+      const player = getPlayerForGuild(message.guild.id);
+      if (!player || !getCurrentTrack(player)) return message.reply("❌ Không có bài hát đang phát.");
+      if (!(await requireSameVoiceForMessage(message, player))) return;
       await player.skip();
       return message.reply("⏭️ Đã chuyển bài!");
     }
 
-    if (command === "stop") {
-      const player = getPlayer(message.guild.id);
-      if (!player) return message.reply("❌ Bot không trong kênh thoại!");
-      await stopAndLeave(player);
-      return message.reply("⏹️ Đã dừng nhạc.");
+    if (command === "skipto") {
+      const player = getPlayerForGuild(message.guild.id);
+      if (!player || !getCurrentTrack(player)) return message.reply("❌ Hàng chờ đang trống.");
+      if (!(await requireSameVoiceForMessage(message, player))) return;
+      const position = Number.parseInt(args[0], 10);
+      if (!Number.isInteger(position) || position < 1) return message.reply("❌ Vui lòng nhập số thứ tự hợp lệ.");
+      const success = await skipToPosition(player, position);
+      if (!success) return message.reply("❌ Vị trí không tồn tại trong hàng chờ.");
+      return message.reply(`⏩ Đã chuyển đến bài số **${position}** trong hàng chờ.`);
     }
 
-    // --- XỬ LÝ LỆNH ADMIN TỪ PREFIX (!admin / !stats / !clear) ---
-    if (command === "admin" || command === "stats" || command === "clear" || command === "leave") {
+    if (command === "shuffle") {
+      const player = getPlayerForGuild(message.guild.id);
+      if (!player || getAllQueueTracks(player).length < 2) return message.reply("❌ Cần ít nhất 2 bài trong hàng chờ để trộn.");
+      if (!(await requireSameVoiceForMessage(message, player))) return;
+      if (typeof player.shuffle === "function") await player.shuffle();
+      else if (typeof player.queue?.shuffle === "function") await player.queue.shuffle();
+      else return message.reply("❌ Trình phát hiện không hỗ trợ trộn hàng chờ.");
+      return message.reply("🔀 Đã trộn hàng chờ!");
+    }
+
+    if (command === "stop") {
+      const player = getPlayerForGuild(message.guild.id);
+      if (!player) return message.reply("❌ Bot hiện không phát nhạc.");
+      if (!(await requireSameVoiceForMessage(message, player))) return;
+      await stopAndLeave(player);
+      return message.reply("⏹️ Đã dừng nhạc và rời kênh thoại.");
+    }
+
+    if (["admin", "stats", "clear", "leave"].includes(command)) {
       if (!isAdmin(message.author.id)) {
-        return message.reply("⛔ Bạn không có quyền sử dụng lệnh Admin!");
+        return message.reply("⛔ Bạn không có quyền sử dụng lệnh Admin.");
       }
 
-      const sub = args[0]?.toLowerCase() || command;
-
-      if (sub === "stats") {
-        const memoryUsage = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2);
-        const totalMem = (os.totalmem() / 1024 / 1024 / 1024).toFixed(2);
+      const subcommand = command === "admin" ? (args[0] || "").toLowerCase() : command;
+      if (subcommand === "stats") {
+        const memory = process.memoryUsage();
+        const formatMb = (bytes) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+        const stats = typeof manager.getStats === "function" ? manager.getStats() : {};
         const uptime = Math.floor(process.uptime());
-
         const embed = new EmbedBuilder()
           .setColor("#FFD700")
-          .setTitle("📊 Thông Số Tài Nguyên Máy Chủ Admin")
+          .setTitle("📊 Thông số NEXORA MUSIC VIP")
           .addFields(
-            { name: "💾 Bộ nhớ RAM tiêu thụ", value: `${memoryUsage} MB / ${totalMem} GB`, inline: true },
-            { name: "⏱️ Uptime", value: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${uptime % 60}s`, inline: true },
-            { name: "⚙️ Node.js Version", value: process.version, inline: true }
+            { name: "RAM tiến trình (RSS)", value: formatMb(memory.rss), inline: true },
+            { name: "Heap đang dùng", value: formatMb(memory.heapUsed), inline: true },
+            { name: "Uptime", value: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${uptime % 60}s`, inline: true },
+            { name: "Node.js", value: process.version, inline: true },
+            { name: "Discord servers", value: String(client.guilds.cache.size), inline: true },
+            { name: "Player đang quản lý", value: String(stats?.totalPlayers ?? "N/A"), inline: true },
           );
-
         return message.reply({ embeds: [embed] });
       }
 
-      if (sub === "clearqueue" || sub === "clear") {
-        const player = getPlayer(message.guild.id);
-        if (!player) return message.reply("❌ Bot không trong phòng thoại!");
-        if (typeof player.queue.clear === "function") player.queue.clear();
-        return message.reply("🧹 **[ADMIN]** Đã xói sạch toàn bộ danh sách chờ!");
+      if (["clearqueue", "clear"].includes(subcommand)) {
+        const player = getPlayerForGuild(message.guild.id);
+        if (!player) return message.reply("❌ Bot không có trình phát trong máy chủ này.");
+        if (typeof player.queue?.clear === "function") player.queue.clear();
+        return message.reply("🧹 Đã xóa toàn bộ hàng chờ. Bài đang phát (nếu có) sẽ không bị dừng.");
       }
 
-      if (sub === "forceleave" || sub === "leave") {
-        const player = getPlayer(message.guild.id);
-        if (!player) return message.reply("❌ Bot không trong phòng thoại!");
+      if (["forceleave", "leave"].includes(subcommand)) {
+        const player = getPlayerForGuild(message.guild.id);
+        if (!player) return message.reply("❌ Bot hiện không ở trong kênh thoại.");
         await stopAndLeave(player);
-        return message.reply("🛑 **[ADMIN]** Đã buộc bot rời phòng!");
+        return message.reply("🛑 [ADMIN] Đã buộc bot dừng và rời kênh thoại.");
       }
     }
-  } catch (err) {
-    console.error(`[Prefix error: ${command}]`, err);
-  }
-});
-
-// --- SLASH COMMANDS & INTERACTIONS ---
-client.on("interactionCreate", async (interaction) => {
-  if (!interaction.guild) return;
-
-  if (interaction.isChatInputCommand()) {
-    const { commandName } = interaction;
-    const voiceChannel = interaction.member?.voice?.channel;
-
-    try {
-      if (commandName === "play") {
-        if (!voiceChannel) return interaction.reply({ content: "❌ Bạn phải vào kênh thoại trước!", flags: EPHEMERAL });
-        await interaction.deferReply();
-        const ok = await enqueue({
-          guildId: interaction.guildId,
-          textChannel: interaction.channel,
-          voiceChannel,
-          userId: interaction.user.id,
-          query: interaction.options.getString("query", true),
-        });
-        if (!ok) return interaction.editReply("❌ Không tìm thấy kết quả.");
-        return interaction.editReply("🔍 Đã thêm vào hàng chờ!");
-      }
-
-      if (commandName === "queue") {
-        const player = getPlayer(interaction.guildId);
-        if (!player || !player.currentTrack) return interaction.reply({ content: "🎶 Hàng chờ trống.", flags: EPHEMERAL });
-        return interaction.reply({ ...buildQueuePage(player, 1), flags: EPHEMERAL });
-      }
-
-      if (commandName === "skipto") {
-        const player = getPlayer(interaction.guildId);
-        if (!player || !player.currentTrack) return interaction.reply({ content: "❌ Hàng chờ trống!", flags: EPHEMERAL });
-        const pos = interaction.options.getInteger("position", true);
-        const success = await skipToPosition(player, pos);
-        if (!success) return interaction.reply({ content: "❌ Vị trí không hợp lệ!", flags: EPHEMERAL });
-        return interaction.reply(`⏩ Đã nhảy thẳng tới bài số **${pos}**!`);
-      }
-
-      if (commandName === "stop") {
-        const player = getPlayer(interaction.guildId);
-        if (!player) return interaction.reply({ content: "❌ Bot không trong phòng thoại!", flags: EPHEMERAL });
-        await stopAndLeave(player);
-        return interaction.reply("⏹️ Đã dừng nhạc.");
-      }
-
-      // --- XỬ LÝ LỆNH ADMIN TỪ SLASH (/admin) ---
-      if (commandName === "admin") {
-        if (!isAdmin(interaction.user.id)) {
-          return interaction.reply({ content: "⛔ Bạn không có quyền Admin!", flags: EPHEMERAL });
-        }
-
-        const sub = interaction.options.getSubcommand();
-
-        if (sub === "stats") {
-          const memoryUsage = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2);
-          const totalMem = (os.totalmem() / 1024 / 1024 / 1024).toFixed(2);
-          const uptime = Math.floor(process.uptime());
-
-          const embed = new EmbedBuilder()
-            .setColor("#FFD700")
-            .setTitle("📊 Thông Số Tài Nguyên Máy Chủ Admin")
-            .addFields(
-              { name: "💾 Bộ nhớ RAM tiêu thụ", value: `${memoryUsage} MB / ${totalMem} GB`, inline: true },
-              { name: "⏱️ Uptime", value: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${uptime % 60}s`, inline: true },
-              { name: "⚙️ Node.js Version", value: process.version, inline: true }
-            );
-
-          return interaction.reply({ embeds: [embed], flags: EPHEMERAL });
-        }
-
-        if (sub === "clearqueue") {
-          const player = getPlayer(interaction.guildId);
-          if (!player) return interaction.reply({ content: "❌ Bot không trong phòng thoại!", flags: EPHEMERAL });
-          if (typeof player.queue.clear === "function") player.queue.clear();
-          return interaction.reply({ content: "🧹 **[ADMIN]** Đã xóa sạch toàn bộ hàng chờ!", flags: EPHEMERAL });
-        }
-
-        if (sub === "forceleave") {
-          const player = getPlayer(interaction.guildId);
-          if (!player) return interaction.reply({ content: "❌ Bot không trong phòng thoại!", flags: EPHEMERAL });
-          await stopAndLeave(player);
-          return interaction.reply({ content: "🛑 **[ADMIN]** Đã buộc bot rời phòng!", flags: EPHEMERAL });
-        }
-      }
-    } catch (err) {
-      console.error(`[Slash command error: ${commandName}]`, err);
-    }
-    return;
-  }
-
-  // --- XỬ LÝ NÚT BẤM VÀ CÁC MENU THẢ XUỐNG ---
-  if (interaction.isButton() || interaction.isStringSelectMenu()) {
-    const player = getPlayer(interaction.guildId);
-    if (!player) return interaction.reply({ content: "❌ Bot không ở trong kênh thoại!", flags: EPHEMERAL });
-
-    try {
-      // 1. Phát trực tiếp 1 bài từ Menu chọn bài
-      if (interaction.isStringSelectMenu() && interaction.customId === "q_play_track_menu") {
-        const targetPos = parseInt(interaction.values[0].split("_")[1]) || 1;
-        await skipToPosition(player, targetPos);
-        return interaction.reply({ content: `⏩ Đã phát ngay bài hát số **${targetPos}**!`, flags: EPHEMERAL });
-      }
-
-      // 2. Chuyển trang queue từ Menu chọn trang
-      if (interaction.isStringSelectMenu() && interaction.customId === "q_jump_menu") {
-        const targetPage = parseInt(interaction.values[0].split("_")[1]) || 1;
-        return interaction.update(buildQueuePage(player, targetPage));
-      }
-
-      // 3. Nút phân trang queue (<< < > >>)
-      if (interaction.isButton() && interaction.customId.startsWith("q_")) {
-        const parts = interaction.customId.split("_");
-        const action = parts[1];
-        let currentPage = parseInt(parts[2]) || 1;
-
-        const tracks = getAllQueueTracks(player);
-        const totalPages = Math.ceil(tracks.length / 10) || 1;
-
-        if (action === "first") currentPage = 1;
-        else if (action === "prev") currentPage = Math.max(1, currentPage - 1);
-        else if (action === "next") currentPage = Math.min(totalPages, currentPage + 1);
-        else if (action === "last") currentPage = totalPages;
-
-        return interaction.update(buildQueuePage(player, currentPage));
-      }
-
-      // 4. Nút bấm điều khiển nhạc (Pause, Skip, Queue, Stop)
-      if (interaction.isButton() && interaction.customId.startsWith("music_")) {
-        const id = interaction.customId;
-        if (id === "music_queue") {
-          return interaction.reply({ ...buildQueuePage(player, 1), flags: EPHEMERAL });
-        }
-
-        await interaction.deferUpdate().catch(() => {});
-        if (id === "music_pause") {
-          if (!player.pause()) player.resume();
-        } else if (id === "music_skip") {
-          await player.skip();
-        } else if (id === "music_stop") {
-          await stopAndLeave(player);
-        }
-      }
-    } catch (err) {
-      console.error("[Interaction error]", err);
-    }
-  }
-});
-
-client.once(Events.ClientReady, async () => {
-  console.log(`✅ NEXORA MUSIC VIP sẵn sàng: ${client.user.tag}`);
-  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
-  try {
-    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-    console.log("🚀 Slash Commands đã sẵn sàng!");
   } catch (error) {
-    console.error("❌ Slash command error:", error);
+    console.error(`[Prefix command error: ${command}]`, error);
+    await message.reply(getSafeErrorMessage(error)).catch(() => {});
+  }
+}
+
+client.on("messageCreate", handlePrefixCommand);
+
+// --------------------------- Slash interactions ---------------------------
+
+async function handleSlashCommand(interaction) {
+  const { commandName } = interaction;
+  const voiceChannel = interaction.member?.voice?.channel;
+
+  if (commandName === "play") {
+    if (!voiceChannel) {
+      return interaction.reply({ content: "❌ Bạn cần vào kênh thoại trước khi phát nhạc.", flags: EPHEMERAL });
+    }
+
+    await interaction.deferReply();
+    const ok = await enqueue({
+      guildId: interaction.guildId,
+      textChannel: interaction.channel,
+      voiceChannel,
+      userId: interaction.user.id,
+      query: interaction.options.getString("query", true),
+    });
+    return interaction.editReply(ok ? "🔍 Đã thêm yêu cầu vào trình phát!" : "❌ Không tìm thấy bài hát phù hợp.");
+  }
+
+  if (commandName === "queue") {
+    const player = getPlayerForGuild(interaction.guildId);
+    if (!player) return interaction.reply({ content: "🎶 Hàng chờ đang trống.", flags: EPHEMERAL });
+    return interaction.reply({ ...buildQueuePage(player, 1), flags: EPHEMERAL });
+  }
+
+  if (commandName === "nowplaying") {
+    const player = getPlayerForGuild(interaction.guildId);
+    if (!player || !getCurrentTrack(player)) {
+      return interaction.reply({ content: "🎶 Hiện không có bài hát nào đang phát.", flags: EPHEMERAL });
+    }
+    return interaction.reply({ embeds: [buildNowPlayingEmbed(player)], flags: EPHEMERAL });
+  }
+
+  if (commandName === "skip") {
+    const player = getPlayerForGuild(interaction.guildId);
+    if (!player || !getCurrentTrack(player)) {
+      return interaction.reply({ content: "❌ Không có bài hát đang phát.", flags: EPHEMERAL });
+    }
+    if (!(await requireSameVoiceForInteraction(interaction, player))) return;
+    await player.skip();
+    return interaction.reply({ content: "⏭️ Đã chuyển bài!", flags: EPHEMERAL });
+  }
+
+  if (commandName === "skipto") {
+    const player = getPlayerForGuild(interaction.guildId);
+    if (!player || !getCurrentTrack(player)) {
+      return interaction.reply({ content: "❌ Hàng chờ đang trống.", flags: EPHEMERAL });
+    }
+    if (!(await requireSameVoiceForInteraction(interaction, player))) return;
+    const position = interaction.options.getInteger("position", true);
+    const success = await skipToPosition(player, position);
+    if (!success) {
+      return interaction.reply({ content: "❌ Vị trí không tồn tại trong hàng chờ.", flags: EPHEMERAL });
+    }
+    return interaction.reply({ content: `⏩ Đã chuyển đến bài số **${position}** trong hàng chờ.`, flags: EPHEMERAL });
+  }
+
+  if (commandName === "shuffle") {
+    const player = getPlayerForGuild(interaction.guildId);
+    if (!player || getAllQueueTracks(player).length < 2) {
+      return interaction.reply({ content: "❌ Cần ít nhất 2 bài trong hàng chờ để trộn.", flags: EPHEMERAL });
+    }
+    if (!(await requireSameVoiceForInteraction(interaction, player))) return;
+    if (typeof player.shuffle === "function") await player.shuffle();
+    else if (typeof player.queue?.shuffle === "function") await player.queue.shuffle();
+    else return interaction.reply({ content: "❌ Trình phát hiện không hỗ trợ trộn hàng chờ.", flags: EPHEMERAL });
+    return interaction.reply({ content: "🔀 Đã trộn hàng chờ!", flags: EPHEMERAL });
+  }
+
+  if (commandName === "stop") {
+    const player = getPlayerForGuild(interaction.guildId);
+    if (!player) return interaction.reply({ content: "❌ Bot hiện không phát nhạc.", flags: EPHEMERAL });
+    if (!(await requireSameVoiceForInteraction(interaction, player))) return;
+    await stopAndLeave(player);
+    return interaction.reply({ content: "⏹️ Đã dừng nhạc và rời kênh thoại.", flags: EPHEMERAL });
+  }
+
+  if (commandName === "admin") {
+    if (!isAdmin(interaction.user.id)) {
+      return interaction.reply({ content: "⛔ Bạn không có quyền Admin.", flags: EPHEMERAL });
+    }
+
+    const subcommand = interaction.options.getSubcommand();
+    if (subcommand === "stats") {
+      const memory = process.memoryUsage();
+      const formatMb = (bytes) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+      const stats = typeof manager.getStats === "function" ? manager.getStats() : {};
+      const uptime = Math.floor(process.uptime());
+      const embed = new EmbedBuilder()
+        .setColor("#FFD700")
+        .setTitle("📊 Thông số NEXORA MUSIC VIP")
+        .addFields(
+          { name: "RAM tiến trình (RSS)", value: formatMb(memory.rss), inline: true },
+          { name: "Heap đang dùng", value: formatMb(memory.heapUsed), inline: true },
+          { name: "Uptime", value: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${uptime % 60}s`, inline: true },
+          { name: "Node.js", value: process.version, inline: true },
+          { name: "Discord servers", value: String(client.guilds.cache.size), inline: true },
+          { name: "Player đang quản lý", value: String(stats?.totalPlayers ?? "N/A"), inline: true },
+        );
+      return interaction.reply({ embeds: [embed], flags: EPHEMERAL });
+    }
+
+    if (subcommand === "clearqueue") {
+      const player = getPlayerForGuild(interaction.guildId);
+      if (!player) return interaction.reply({ content: "❌ Không có trình phát trong máy chủ này.", flags: EPHEMERAL });
+      if (typeof player.queue?.clear === "function") player.queue.clear();
+      return interaction.reply({ content: "🧹 Đã xóa toàn bộ hàng chờ. Bài đang phát (nếu có) sẽ không bị dừng.", flags: EPHEMERAL });
+    }
+
+    if (subcommand === "forceleave") {
+      const player = getPlayerForGuild(interaction.guildId);
+      if (!player) return interaction.reply({ content: "❌ Bot hiện không ở trong kênh thoại.", flags: EPHEMERAL });
+      await stopAndLeave(player);
+      return interaction.reply({ content: "🛑 Đã buộc bot dừng và rời kênh thoại.", flags: EPHEMERAL });
+    }
+  }
+}
+
+async function handleComponentInteraction(interaction) {
+  const isButton = interaction.isButton();
+  const isSelectMenu = interaction.isStringSelectMenu();
+  if (!isButton && !isSelectMenu) return;
+
+  const customId = interaction.customId;
+  if (!customId.startsWith("q_") && !customId.startsWith("music_")) return;
+
+  const player = getPlayerForGuild(interaction.guildId);
+  if (!player) {
+    return interaction.reply({ content: "❌ Bot hiện không có trình phát trong máy chủ này.", flags: EPHEMERAL });
+  }
+
+  if (isSelectMenu && customId === "q_play_track_menu") {
+    if (!(await requireSameVoiceForInteraction(interaction, player))) return;
+    const targetPosition = Number.parseInt(interaction.values[0]?.split("_")[1], 10);
+    await interaction.deferReply({ flags: EPHEMERAL });
+    const success = await skipToPosition(player, targetPosition);
+    return interaction.editReply(
+      success
+        ? `⏩ Đã chọn bài số **${targetPosition}** để phát tiếp theo.`
+        : "❌ Vị trí không còn tồn tại trong hàng chờ. Hãy mở lại hàng chờ rồi chọn lại.",
+    );
+  }
+
+  if (isSelectMenu && customId === "q_jump_menu") {
+    const targetPage = Number.parseInt(interaction.values[0]?.split("_")[1], 10) || 1;
+    return interaction.update(buildQueuePage(player, targetPage));
+  }
+
+  if (isButton && customId.startsWith("q_")) {
+    const [, action, pageText] = customId.split("_");
+    let page = Number.parseInt(pageText, 10) || 1;
+    const totalPages = Math.max(1, Math.ceil(getAllQueueTracks(player).length / QUEUE_PAGE_SIZE));
+
+    if (action === "first") page = 1;
+    else if (action === "prev") page = Math.max(1, page - 1);
+    else if (action === "next") page = Math.min(totalPages, page + 1);
+    else if (action === "last") page = totalPages;
+    else return;
+
+    return interaction.update(buildQueuePage(player, page));
+  }
+
+  if (isButton && customId.startsWith("music_")) {
+    if (customId === "music_queue") {
+      return interaction.reply({ ...buildQueuePage(player, 1), flags: EPHEMERAL });
+    }
+
+    if (!["music_pause", "music_skip", "music_stop"].includes(customId)) return;
+    if (!(await requireSameVoiceForInteraction(interaction, player))) return;
+    if (customId !== "music_stop" && !getCurrentTrack(player)) {
+      return interaction.reply({ content: "❌ Hiện không có bài hát đang phát.", flags: EPHEMERAL });
+    }
+
+    await interaction.deferUpdate();
+    const userdata = ensureUserdata(player);
+
+    if (customId === "music_pause") {
+      if (userdata.paused) {
+        await player.resume();
+        userdata.paused = false;
+      } else {
+        await player.pause();
+        userdata.paused = true;
+      }
+    } else if (customId === "music_skip") {
+      await player.skip();
+    } else if (customId === "music_stop") {
+      await stopAndLeave(player);
+    }
+  }
+}
+
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.inGuild()) return;
+
+  try {
+    if (interaction.isChatInputCommand()) {
+      await handleSlashCommand(interaction);
+      return;
+    }
+    await handleComponentInteraction(interaction);
+  } catch (error) {
+    console.error("[Interaction error]", error);
+    await sendInteractionError(interaction, getSafeErrorMessage(error));
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// --------------------------- Startup ---------------------------
+
+client.once(Events.ClientReady, async (readyClient) => {
+  console.log(`✅ NEXORA MUSIC VIP ready: ${readyClient.user.tag}`);
+
+  try {
+    const rest = new REST({ version: "10" }).setToken(TOKEN);
+    await rest.put(Routes.applicationCommands(readyClient.user.id), { body: commands });
+    console.log("🚀 Slash commands registered.");
+  } catch (error) {
+    console.error("❌ Could not register slash commands:", error);
+  }
+});
+
+client.on("error", (error) => {
+  console.error("[Discord client error]", error);
+});
+
+if (!TOKEN) {
+  console.error("❌ Missing DISCORD_TOKEN. Add it to your hosting environment or .env file.");
+  process.exitCode = 1;
+  if (webServer.listening) webServer.close();
+  else webServer.once("listening", () => webServer.close());
+} else {
+  client.login(TOKEN).catch((error) => {
+    console.error("❌ Discord login failed:", error);
+    process.exitCode = 1;
+    client.destroy();
+    webServer.close();
+  });
+}
