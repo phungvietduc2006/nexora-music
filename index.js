@@ -56,13 +56,26 @@ const EPHEMERAL = MessageFlags.Ephemeral;
 
 const ADMIN_USER_IDS = ["1073520375285166100"];
 
+// --- HÀM XỬ LÝ LINK SOUNDCLOUD AN TOÀN (CHỐNG LỖI MẤT KẾT NỐI) ---
 async function resolveQuery(query) {
   if (typeof query === "string" && query.includes("on.soundcloud.com")) {
     try {
-      const res = await fetch(query, { method: "HEAD", redirect: "follow" });
-      if (res.url && !res.url.includes("on.soundcloud.com")) return res.url;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 4000);
+      
+      const res = await fetch(query, { 
+        method: "HEAD", 
+        redirect: "follow",
+        signal: controller.signal,
+        headers: { "User-Agent": "Mozilla/5.0" }
+      });
+      clearTimeout(timeoutId);
+      
+      if (res.url && !res.url.includes("on.soundcloud.com")) {
+        return res.url;
+      }
     } catch (e) {
-      console.error("[SoundCloud Resolve Error]:", e);
+      console.error("[SoundCloud Unshorten Warning]:", e.message);
     }
   }
   return query;
@@ -78,7 +91,6 @@ const commands = [
     ),
   new SlashCommandBuilder().setName("skip").setDescription("Bỏ qua bài hát hiện tại"),
   
-  // Lệnh Skip tới bài số mấy
   new SlashCommandBuilder()
     .setName("skipto")
     .setDescription("Nhảy cóc phát thẳng tới số thứ tự bài hát trong hàng chờ")
@@ -137,10 +149,6 @@ const commands = [
     .addSubcommand((s) => s.setName("forceleave").setDescription("Buộc bot rời phòng")),
 ].map((cmd) => cmd.toJSON());
 
-function isAdmin(userId) {
-  return ADMIN_USER_IDS.includes(userId);
-}
-
 function resolveUserMention(req, fallbackId) {
   const pick = (v) => {
     if (!v) return null;
@@ -180,7 +188,7 @@ function getAllQueueTracks(player) {
   return list;
 }
 
-// --- HÀM TẠO GIAO DIỆN HÀNG CHỜ KÈM NÚT VÀ MENU CHỌN TRANG ---
+// --- HÀM TẠO GIAO DIỆN HÀNG CHỜ KÈM NÚT & MENU CHỌN TRANG ---
 function buildQueuePage(player, page = 1, pageSize = 10) {
   const tracks = getAllQueueTracks(player);
   const totalTracks = tracks.length;
@@ -209,7 +217,6 @@ function buildQueuePage(player, page = 1, pageSize = 10) {
     .setDescription(desc)
     .setFooter({ text: `Tổng số bài hát: ${totalTracks} bài` });
 
-  // Hàng 1: Nút điều hướng phân trang (<< < > >>)
   const buttons = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`q_first_${currentPage}`).setLabel("<<").setStyle(ButtonStyle.Secondary).setDisabled(currentPage === 1),
     new ButtonBuilder().setCustomId(`q_prev_${currentPage}`).setLabel("<").setStyle(ButtonStyle.Primary).setDisabled(currentPage === 1),
@@ -219,12 +226,10 @@ function buildQueuePage(player, page = 1, pageSize = 10) {
 
   const componentsArray = [buttons];
 
-  // Hàng 2: Menu chọn trang nhanh (Select Menu) nếu tổng trang > 1
   if (totalPages > 1) {
     const selectMenu = new StringSelectMenuBuilder()
       .setCustomId("q_jump_menu")
-      .setPlaceholder("📌 Chọn trang hàng chờ nhanh...")
-      ;
+      .setPlaceholder("📌 Chọn trang hàng chờ nhanh...");
 
     const options = [];
     for (let i = 1; i <= Math.min(25, totalPages); i++) {
@@ -288,12 +293,9 @@ async function stopAndLeave(player) {
   await player.destroy();
 }
 
-// Hàm nhảy cóc tới bài hát thứ N trong queue
 async function skipToPosition(player, position) {
   const tracks = getAllQueueTracks(player);
   if (position < 1 || position > tracks.length) return false;
-  
-  // Ziplayer hỗ trợ loại bỏ các bài trước đó hoặc nhảy trực tiếp
   if (typeof player.queue.remove === "function") {
     for (let i = 0; i < position - 1; i++) {
       player.queue.remove(0);
@@ -457,20 +459,17 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  // --- XỬ LÝ NÚT BẤM & MENU CHỌN TRANG ---
   if (interaction.isButton() || interaction.isStringSelectMenu()) {
     const player = getPlayer(interaction.guildId);
     if (!player) return interaction.reply({ content: "❌ Bot không trong kênh thoại!", flags: EPHEMERAL });
 
     try {
-      // Xử lý Menu chọn trang nhanh
       if (interaction.isStringSelectMenu() && interaction.customId === "q_jump_menu") {
-        const selectedValue = interaction.values[0]; // dạng "page_3"
+        const selectedValue = interaction.values[0];
         const targetPage = parseInt(selectedValue.split("_")[1]) || 1;
         return interaction.update(buildQueuePage(player, targetPage));
       }
 
-      // Xử lý nút bấm phân trang (<< < > >>)
       if (interaction.isButton() && interaction.customId.startsWith("q_")) {
         const parts = interaction.customId.split("_");
         const action = parts[1];
@@ -487,7 +486,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.update(buildQueuePage(player, currentPage));
       }
 
-      // Xử lý nút điều khiển nhạc
       if (interaction.isButton() && interaction.customId.startsWith("music_")) {
         const id = interaction.customId;
         if (id === "music_queue") {
@@ -510,7 +508,7 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 client.once(Events.ClientReady, async () => {
-  console.log(`✅ NEXORA MUSIC VIP (Jump Page + SkipTo) sẵn sàng: ${client.user.tag}`);
+  console.log(`✅ NEXORA MUSIC VIP sẵn sàng: ${client.user.tag}`);
 
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   try {
