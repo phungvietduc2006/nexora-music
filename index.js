@@ -1,4 +1,4 @@
-import {
+yimport {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
@@ -431,4 +431,16 @@ client.on("interactionCreate", async (interaction) => {
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Bot NEXORA MUSIC VIP (SoundCloud + Queue Pagination) sẵn sàng: ${client.user.tag}`);
 
-  const
+  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+  try {
+    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+    console.log("🚀 Đăng ký Slash Commands thành công!");
+  } catch (error) {
+    console.error("❌ Lỗi Slash Commands:", error);
+  }
+});
+
+process.on("unhandledRejection", (err) => console.error("[unhandledRejection]", err));
+process.on("uncaughtException", (err) => console.error("[uncaughtException]", err));
+
+client.login(process.env.DISCORD_TOKEN);
