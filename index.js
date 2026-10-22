@@ -5,6 +5,8 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -54,14 +56,11 @@ const EPHEMERAL = MessageFlags.Ephemeral;
 
 const ADMIN_USER_IDS = ["1073520375285166100"];
 
-// --- HÀM TỰ ĐỘNG CHUYỂN LINK SOUNDCLOUD RÚT GỌN (on.soundcloud.com) THÀNH LINK GỐC ---
 async function resolveQuery(query) {
   if (typeof query === "string" && query.includes("on.soundcloud.com")) {
     try {
       const res = await fetch(query, { method: "HEAD", redirect: "follow" });
-      if (res.url && !res.url.includes("on.soundcloud.com")) {
-        return res.url;
-      }
+      if (res.url && !res.url.includes("on.soundcloud.com")) return res.url;
     } catch (e) {
       console.error("[SoundCloud Resolve Error]:", e);
     }
@@ -73,13 +72,22 @@ async function resolveQuery(query) {
 const commands = [
   new SlashCommandBuilder()
     .setName("play")
-    .setDescription("Phát nhạc từ YouTube, SoundCloud, Spotify hoặc tên bài hát")
+    .setDescription("Phát nhạc từ YouTube, SoundCloud, Spotify")
     .addStringOption((option) =>
-      option.setName("query").setDescription("Tên bài hát hoặc URL (YouTube, SoundCloud, Spotify)").setRequired(true)
+      option.setName("query").setDescription("Tên bài hát hoặc URL").setRequired(true)
     ),
   new SlashCommandBuilder().setName("skip").setDescription("Bỏ qua bài hát hiện tại"),
-  new SlashCommandBuilder().setName("queue").setDescription("Xem danh sách hàng chờ phát nhạc (Phân trang VIP)"),
-  new SlashCommandBuilder().setName("stop").setDescription("Dừng nhạc và rời phòng thoại"),
+  
+  // Lệnh Skip tới bài số mấy
+  new SlashCommandBuilder()
+    .setName("skipto")
+    .setDescription("Nhảy cóc phát thẳng tới số thứ tự bài hát trong hàng chờ")
+    .addIntegerOption((option) =>
+      option.setName("position").setDescription("Số thứ tự bài hát trong hàng chờ").setRequired(true).setMinValue(1)
+    ),
+
+  new SlashCommandBuilder().setName("queue").setDescription("Xem danh sách hàng chờ (Phân trang & Menu chọn trang)"),
+  new SlashCommandBuilder().setName("stop").setDescription("Dừng nhạc và rời phòng"),
   new SlashCommandBuilder().setName("nowplaying").setDescription("Xem thông tin bài đang phát"),
   new SlashCommandBuilder().setName("shuffle").setDescription("Trộn ngẫu nhiên hàng chờ"),
   
@@ -99,7 +107,7 @@ const commands = [
         .setDescription("Kiểu lặp")
         .setRequired(true)
         .addChoices(
-          { name: "🔂 Bài hát hiện tại", value: "track" },
+          { name: "🔂 Bài hiện tại", value: "track" },
           { name: "🔁 Toàn bộ hàng chờ", value: "queue" },
           { name: "➡️ Tắt lặp", value: "off" }
         )
@@ -107,7 +115,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("filter")
-    .setDescription("Chỉnh hiệu ứng âm thanh (Audio Filter)")
+    .setDescription("Chỉnh hiệu ứng âm thanh")
     .addStringOption((option) =>
       option
         .setName("preset")
@@ -124,7 +132,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName("admin")
     .setDescription("Hệ thống quản trị Admin")
-    .addSubcommand((s) => s.setName("stats").setDescription("Trạng thái tài nguyên máy chủ"))
+    .addSubcommand((s) => s.setName("stats").setDescription("Trạng thái tài nguyên"))
     .addSubcommand((s) => s.setName("clearqueue").setDescription("Xóa sạch hàng chờ"))
     .addSubcommand((s) => s.setName("forceleave").setDescription("Buộc bot rời phòng")),
 ].map((cmd) => cmd.toJSON());
@@ -172,6 +180,7 @@ function getAllQueueTracks(player) {
   return list;
 }
 
+// --- HÀM TẠO GIAO DIỆN HÀNG CHỜ KÈM NÚT VÀ MENU CHỌN TRANG ---
 function buildQueuePage(player, page = 1, pageSize = 10) {
   const tracks = getAllQueueTracks(player);
   const totalTracks = tracks.length;
@@ -200,6 +209,7 @@ function buildQueuePage(player, page = 1, pageSize = 10) {
     .setDescription(desc)
     .setFooter({ text: `Tổng số bài hát: ${totalTracks} bài` });
 
+  // Hàng 1: Nút điều hướng phân trang (<< < > >>)
   const buttons = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`q_first_${currentPage}`).setLabel("<<").setStyle(ButtonStyle.Secondary).setDisabled(currentPage === 1),
     new ButtonBuilder().setCustomId(`q_prev_${currentPage}`).setLabel("<").setStyle(ButtonStyle.Primary).setDisabled(currentPage === 1),
@@ -207,7 +217,30 @@ function buildQueuePage(player, page = 1, pageSize = 10) {
     new ButtonBuilder().setCustomId(`q_last_${currentPage}`).setLabel(">>").setStyle(ButtonStyle.Secondary).setDisabled(currentPage === totalPages)
   );
 
-  return { embeds: [embed], components: [buttons] };
+  const componentsArray = [buttons];
+
+  // Hàng 2: Menu chọn trang nhanh (Select Menu) nếu tổng trang > 1
+  if (totalPages > 1) {
+    const selectMenu = new StringSelectMenuBuilder()
+      .setCustomId("q_jump_menu")
+      .setPlaceholder("📌 Chọn trang hàng chờ nhanh...")
+      ;
+
+    const options = [];
+    for (let i = 1; i <= Math.min(25, totalPages); i++) {
+      options.push(
+        new StringSelectMenuOptionBuilder()
+          .setLabel(`Trang ${i}`)
+          .setValue(`page_${i}`)
+          .setDescription(`Xem các bài từ số ${(i - 1) * pageSize + 1}`)
+          .setDefault(i === currentPage)
+      );
+    }
+    selectMenu.addOptions(options);
+    componentsArray.push(new ActionRowBuilder().addComponents(selectMenu));
+  }
+
+  return { embeds: [embed], components: componentsArray };
 }
 
 function createMusicControls() {
@@ -255,6 +288,21 @@ async function stopAndLeave(player) {
   await player.destroy();
 }
 
+// Hàm nhảy cóc tới bài hát thứ N trong queue
+async function skipToPosition(player, position) {
+  const tracks = getAllQueueTracks(player);
+  if (position < 1 || position > tracks.length) return false;
+  
+  // Ziplayer hỗ trợ loại bỏ các bài trước đó hoặc nhảy trực tiếp
+  if (typeof player.queue.remove === "function") {
+    for (let i = 0; i < position - 1; i++) {
+      player.queue.remove(0);
+    }
+  }
+  await player.skip();
+  return true;
+}
+
 manager.on("trackStart", async (player, track) => {
   const channel = player.metadata?.channel;
   if (!channel) return;
@@ -272,7 +320,7 @@ manager.on("trackStart", async (player, track) => {
         { name: "👤 Yêu cầu bởi", value: userMention, inline: true }
       )
       .setThumbnail(track.thumbnail || null)
-      .setFooter({ text: "Nexora Music • SoundCloud / YouTube / Spotify" });
+      .setFooter({ text: "Nexora Music VIP" });
 
     player.metadata.controlMessage = await channel.send({
       embeds: [embed],
@@ -315,21 +363,31 @@ client.on("messageCreate", async (message) => {
         query: message.attachments.first()?.url || rawQuery,
       });
       if (!ok) return message.reply("❌ Không tìm thấy kết quả hợp lệ.");
-      return message.reply(`🔍 Đã thêm bài hát vào hàng chờ bởi <@${message.author.id}>!`);
+      return message.reply(`🔍 Đã thêm bài hát vào hàng chờ!`);
     }
 
     if (command === "skip" || command === "s") {
       const player = getPlayer(message.guild.id);
-      if (!player || !player.currentTrack) return message.reply("❌ Không có bài hát nào đang phát!");
+      if (!player || !player.currentTrack) return message.reply("❌ Không có bài nào đang phát!");
       await player.skip();
       return message.reply("⏭️ Đã chuyển bài!");
     }
 
+    if (command === "skipto") {
+      const player = getPlayer(message.guild.id);
+      if (!player || !player.currentTrack) return message.reply("❌ Hàng chờ đang trống!");
+      const pos = parseInt(args[0]);
+      if (isNaN(pos)) return message.reply("❌ Vui lòng nhập số thứ tự bài hát hợp lệ!");
+      const success = await skipToPosition(player, pos);
+      if (!success) return message.reply("❌ Vị trí bài hát không tồn tại trong hàng chờ!");
+      return message.reply(`⏩ Đã nhảy cóc tới bài hát số **${pos}**!`);
+    }
+
     if (command === "stop") {
       const player = getPlayer(message.guild.id);
-      if (!player) return message.reply("❌ Bot không trong kênh thoại!");
+      if (!player) return message.reply("❌ Bot không trong phòng thoại!");
       await stopAndLeave(player);
-      return message.reply("⏹️ Đã dừng nhạc và rời phòng.");
+      return message.reply("⏹️ Đã dừng nhạc.");
     }
 
     if (command === "queue" || command === "q") {
@@ -342,7 +400,7 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-// --- SLASH COMMANDS & BUTTONS ---
+// --- SLASH COMMANDS & INTERACTIONS ---
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.guild) return;
 
@@ -362,7 +420,7 @@ client.on("interactionCreate", async (interaction) => {
           query: interaction.options.getString("query", true),
         });
         if (!ok) return interaction.editReply("❌ Không tìm thấy kết quả.");
-        return interaction.editReply(`🔍 Đã thêm bài hát vào hàng chờ bởi <@${interaction.user.id}>!`);
+        return interaction.editReply(`🔍 Đã thêm bài hát vào hàng chờ!`);
       }
 
       if (commandName === "queue") {
@@ -378,6 +436,15 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply("⏭️ Đã chuyển bài!");
       }
 
+      if (commandName === "skipto") {
+        const player = getPlayer(interaction.guildId);
+        if (!player || !player.currentTrack) return interaction.reply({ content: "❌ Hàng chờ trống!", flags: EPHEMERAL });
+        const pos = interaction.options.getInteger("position", true);
+        const success = await skipToPosition(player, pos);
+        if (!success) return interaction.reply({ content: "❌ Vị trí bài hát không hợp lệ!", flags: EPHEMERAL });
+        return interaction.reply(`⏩ Đã nhảy cóc phát thẳng tới bài số **${pos}**!`);
+      }
+
       if (commandName === "stop") {
         const player = getPlayer(interaction.guildId);
         if (!player) return interaction.reply({ content: "❌ Bot không trong phòng thoại!", flags: EPHEMERAL });
@@ -390,15 +457,22 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  if (interaction.isButton()) {
+  // --- XỬ LÝ NÚT BẤM & MENU CHỌN TRANG ---
+  if (interaction.isButton() || interaction.isStringSelectMenu()) {
     const player = getPlayer(interaction.guildId);
     if (!player) return interaction.reply({ content: "❌ Bot không trong kênh thoại!", flags: EPHEMERAL });
 
-    const id = interaction.customId;
-
     try {
-      if (id.startsWith("q_")) {
-        const parts = id.split("_");
+      // Xử lý Menu chọn trang nhanh
+      if (interaction.isStringSelectMenu() && interaction.customId === "q_jump_menu") {
+        const selectedValue = interaction.values[0]; // dạng "page_3"
+        const targetPage = parseInt(selectedValue.split("_")[1]) || 1;
+        return interaction.update(buildQueuePage(player, targetPage));
+      }
+
+      // Xử lý nút bấm phân trang (<< < > >>)
+      if (interaction.isButton() && interaction.customId.startsWith("q_")) {
+        const parts = interaction.customId.split("_");
         const action = parts[1];
         let currentPage = parseInt(parts[2]) || 1;
 
@@ -413,7 +487,9 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.update(buildQueuePage(player, currentPage));
       }
 
-      if (id.startsWith("music_")) {
+      // Xử lý nút điều khiển nhạc
+      if (interaction.isButton() && interaction.customId.startsWith("music_")) {
+        const id = interaction.customId;
         if (id === "music_queue") {
           return interaction.reply({ ...buildQueuePage(player, 1), flags: EPHEMERAL });
         }
@@ -428,13 +504,13 @@ client.on("interactionCreate", async (interaction) => {
         }
       }
     } catch (err) {
-      console.error(`[button:${id}]`, err);
+      console.error(`[interaction:${interaction.customId}]`, err);
     }
   }
 });
 
 client.once(Events.ClientReady, async () => {
-  console.log(`✅ NEXORA MUSIC VIP đã sẵn sàng: ${client.user.tag}`);
+  console.log(`✅ NEXORA MUSIC VIP (Jump Page + SkipTo) sẵn sàng: ${client.user.tag}`);
 
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   try {
