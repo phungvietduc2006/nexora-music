@@ -48,6 +48,13 @@ new PlayerManager({
     new AttachmentsPlugin({ maxFileSize: 25 * 1024 * 1024 }),
   ],
   autoCleanup: true,
+  // Thêm cấu hình tối ưu âm thanh chống giật lag, khựng tiếng
+  audioOptions: {
+    highWaterMark: 1 << 25, // Tăng kích thước bộ đệm (buffer) lên tối đa
+    opusEncoding: {
+      bitrate: 96, // Tối ưu hóa tốc độ bit âm thanh ổn định trên server cloud
+    }
+  }
 });
 
 const manager = getManager();
