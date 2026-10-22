@@ -1,0 +1,19 @@
+{
+  "name": "nexora-music",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@ziplayer/plugin": "^1.0.2",
+    "discord.js": "^14.27.0",
+    "dotenv": "^18.0.8",
+    "ziplayer": "^1.0.4"
+  }
+}
