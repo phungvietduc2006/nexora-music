@@ -1,4 +1,4 @@
-yimport {
+import {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
