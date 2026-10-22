@@ -22,7 +22,7 @@ import {
 import express from "express";
 import "dotenv/config";
 
-// --- WEB SERVER GIỮ BOT UPTIME 24/7 ---
+// --- WEB SERVER UPTIME 24/7 ---
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get("/", (req, res) => res.send("NEXORA MUSIC VIP 24/7 is Running!"));
@@ -40,7 +40,7 @@ const client = new Client({
 new PlayerManager({
   plugins: [
     new YouTubePlugin(),
-    new SoundCloudPlugin(), // Hỗ trợ SoundCloud
+    new SoundCloudPlugin(),
     new SpotifyPlugin(),
     new TTSPlugin({ defaultLang: "vi" }),
     new AttachmentsPlugin({ maxFileSize: 25 * 1024 * 1024 }),
@@ -53,6 +53,21 @@ const PREFIX = process.env.PREFIX || "!";
 const EPHEMERAL = MessageFlags.Ephemeral;
 
 const ADMIN_USER_IDS = ["1073520375285166100"];
+
+// --- HÀM TỰ ĐỘNG CHUYỂN LINK SOUNDCLOUD RÚT GỌN (on.soundcloud.com) THÀNH LINK GỐC ---
+async function resolveQuery(query) {
+  if (typeof query === "string" && query.includes("on.soundcloud.com")) {
+    try {
+      const res = await fetch(query, { method: "HEAD", redirect: "follow" });
+      if (res.url && !res.url.includes("on.soundcloud.com")) {
+        return res.url;
+      }
+    } catch (e) {
+      console.error("[SoundCloud Resolve Error]:", e);
+    }
+  }
+  return query;
+}
 
 // --- 1. ĐỊNH NGHĨA SLASH COMMANDS ---
 const commands = [
@@ -157,7 +172,6 @@ function getAllQueueTracks(player) {
   return list;
 }
 
-// --- HÀM TẠO GIAO DIỆN HÀNG CHỜ PHÂN TRANG (PAGINATION) ---
 function buildQueuePage(player, page = 1, pageSize = 10) {
   const tracks = getAllQueueTracks(player);
   const totalTracks = tracks.length;
@@ -213,13 +227,6 @@ async function clearControls(player) {
   }
 }
 
-function inBotVoice(guild, member) {
-  const userChannelId = member?.voice?.channelId;
-  if (!userChannelId) return false;
-  const botChannelId = guild.members.me?.voice?.channelId;
-  return !botChannelId || botChannelId === userChannelId;
-}
-
 async function getOrCreatePlayer(guildId, channel, userId) {
   let player = getPlayer(guildId);
   if (!player) {
@@ -236,9 +243,10 @@ async function getOrCreatePlayer(guildId, channel, userId) {
 }
 
 async function enqueue({ guildId, textChannel, voiceChannel, userId, query }) {
+  const finalQuery = await resolveQuery(query);
   const player = await getOrCreatePlayer(guildId, textChannel, userId);
   if (!player.connection) await player.connect(voiceChannel);
-  return player.play(query, userId);
+  return player.play(finalQuery, userId);
 }
 
 async function stopAndLeave(player) {
@@ -285,7 +293,7 @@ manager.on("playerError", (player, error) => {
   player.metadata?.channel?.send(`⚠️ Lỗi nhạc: ${error?.message || error}`).catch(() => {});
 });
 
-// --- 2. XỬ LÝ LỆNH PREFIX (!) ---
+// --- PREFIX COMMANDS ---
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild || !message.content.startsWith(PREFIX)) return;
 
@@ -296,15 +304,15 @@ client.on("messageCreate", async (message) => {
   try {
     if (command === "play" || command === "p") {
       if (!voiceChannel) return message.reply("❌ Bạn phải vào một kênh thoại trước!");
-      const query = args.join(" ");
-      if (!query && message.attachments.size === 0) return message.reply("❌ Vui lòng nhập tên bài hát hoặc link!");
+      const rawQuery = args.join(" ");
+      if (!rawQuery && message.attachments.size === 0) return message.reply("❌ Vui lòng nhập tên bài hát hoặc link!");
 
       const ok = await enqueue({
         guildId: message.guild.id,
         textChannel: message.channel,
         voiceChannel,
         userId: message.author.id,
-        query: message.attachments.first()?.url || query,
+        query: message.attachments.first()?.url || rawQuery,
       });
       if (!ok) return message.reply("❌ Không tìm thấy kết quả hợp lệ.");
       return message.reply(`🔍 Đã thêm bài hát vào hàng chờ bởi <@${message.author.id}>!`);
@@ -334,7 +342,7 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-// --- 3. XỬ LÝ SLASH COMMANDS & NÚT BẤM PHÂN TRANG ---
+// --- SLASH COMMANDS & BUTTONS ---
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.guild) return;
 
@@ -382,7 +390,6 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  // --- XỬ LÝ NÚT BẤM (BUTTONS) PHÂN TRANG & ĐIỀU KHIỂN ---
   if (interaction.isButton()) {
     const player = getPlayer(interaction.guildId);
     if (!player) return interaction.reply({ content: "❌ Bot không trong kênh thoại!", flags: EPHEMERAL });
@@ -390,7 +397,6 @@ client.on("interactionCreate", async (interaction) => {
     const id = interaction.customId;
 
     try {
-      // Xử lý chuyển trang Queue (<< < > >>)
       if (id.startsWith("q_")) {
         const parts = id.split("_");
         const action = parts[1];
@@ -407,7 +413,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.update(buildQueuePage(player, currentPage));
       }
 
-      // Xử lý trình điều khiển nhạc (Pause, Skip, Stop, Queue)
       if (id.startsWith("music_")) {
         if (id === "music_queue") {
           return interaction.reply({ ...buildQueuePage(player, 1), flags: EPHEMERAL });
@@ -429,7 +434,7 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 client.once(Events.ClientReady, async () => {
-  console.log(`✅ Bot NEXORA MUSIC VIP (SoundCloud + Queue Pagination) sẵn sàng: ${client.user.tag}`);
+  console.log(`✅ NEXORA MUSIC VIP đã sẵn sàng: ${client.user.tag}`);
 
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
   try {
