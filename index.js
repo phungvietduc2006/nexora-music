@@ -1,945 +1,350 @@
-import {
-  Client,
-  GatewayIntentBits,
-  EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  StringSelectMenuBuilder,
-  StringSelectMenuOptionBuilder,
-  REST,
-  Routes,
-  SlashCommandBuilder,
-  MessageFlags,
-  Events,
-} from "discord.js";
-import { PlayerManager } from "ziplayer";
-import {
-  YouTubePlugin,
-  SoundCloudPlugin,
-  SpotifyPlugin,
-  TTSPlugin,
-  AttachmentsPlugin,
-} from "@ziplayer/plugin";
-import express from "express";
-import "dotenv/config";
+from __future__ import annotations
 
-// ============================================================
-// NEXORA MUSIC VIP — optimized bot entry point
-// Requires Node.js 20+ and an ESM project ("type": "module").
-// ============================================================
+import json
+import os
+from pathlib import Path
+import pytest
 
-const TOKEN = process.env.DISCORD_TOKEN?.trim();
-const PREFIX = process.env.PREFIX || "!";
-const PORT = Number(process.env.PORT) || 3000;
-const EPHEMERAL = MessageFlags.Ephemeral;
-const QUEUE_PAGE_SIZE = 10;
-const MAX_TITLE_LENGTH = 180;
+from dex_core import (
+    TrustStore,
+    TrustStoreError,
+    ActionTracker,
+    SpamTracker,
+    Cooldowns,
+    Response,
+    BotAddDecision,
+    decide_response,
+    decide_bot_add,
+    RoleInfo,
+    plan_role_removal,
+    remove_roles_error_means_actor_gone,
+    group_by_channel,
+    chunked,
+    UNKNOWN_MEMBER_CODE,
+)
 
-// Put comma-separated Discord user IDs in ADMIN_USER_IDS in the environment.
-// The existing ID is retained as a fallback so the current configuration keeps working.
-const ADMIN_USER_IDS = new Set(
-  (process.env.ADMIN_USER_IDS || "1073520375285166100")
-    .split(",")
-    .map((id) => id.trim())
-    .filter(Boolean),
-);
 
-function isAdmin(userId) {
-  return ADMIN_USER_IDS.has(userId);
-}
+class DummyAccount:
+    def __init__(self, id: int, bot: bool = False):
+        self.id = id
+        self.bot = bot
 
-// Health-check endpoint for hosting providers. This does not itself guarantee
-// that a hosting provider's free instance will stay awake 24/7.
-const app = express();
-app.disable("x-powered-by");
-app.get("/", (_req, res) => {
-  res.status(200).send("NEXORA MUSIC VIP is running.");
-});
-app.get("/health", (_req, res) => {
-  res.status(200).json({ status: "ok", uptimeSeconds: Math.floor(process.uptime()) });
-});
 
-const webServer = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🌐 Health server listening on port ${PORT}`);
-});
-webServer.on("error", (error) => {
-  console.error("[Web server error]", error);
-});
+# ============================================================================
+# 1. TEST TRUST STORE (Schema, Rollback & Legacy State Protection)
+# ============================================================================
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-});
+def test_trust_store_new_installation(tmp_path: Path):
+    path = tmp_path / "trust.json"
+    store = TrustStore(path)
+    assert not store.initialized
+    assert store.safe
+    assert store.ready is False
+    assert store.guild(123) == {"users": [], "bots": []}
 
-// Register specific matchers (TTS and attachments) before general search plugins.
-// Low-performance mode avoids extra preload/crossfade work on small cloud instances.
-const manager = new PlayerManager({
-  plugins: [
-    new TTSPlugin({ defaultLang: "vi" }),
-    new AttachmentsPlugin({ maxFileSize: 25 * 1024 * 1024 }),
-    new YouTubePlugin(),
-    new SoundCloudPlugin(),
-    new SpotifyPlugin(),
-  ],
-  autoCleanup: true,
-  cleanupInterval: 120_000,
-  extractorTimeout: 30_000,
-  enableSearchCache: true,
-});
 
-// --------------------------- Utilities ---------------------------
+def test_trust_store_valid_persistence_and_filtering(tmp_path: Path):
+    path = tmp_path / "trust.json"
+    store = TrustStore(path)
+    store.init_empty()
+    assert store.ready is True
 
-function ensureUserdata(player) {
-  if (!player.userdata || typeof player.userdata !== "object") {
-    player.userdata = {};
-  }
-  return player.userdata;
-}
+    user1 = DummyAccount(111, bot=False)
+    bot1 = DummyAccount(222, bot=True)
+    
+    assert store.add(123, user1) is True
+    assert store.add(123, user1) is False  # Trùng lặp
+    assert store.add(123, bot1) is True
 
-function getPlayerForGuild(guildId) {
-  return manager.get(guildId) ?? null;
-}
+    store2 = TrustStore(path)
+    assert store2.ready is True
+    assert store2.is_trusted(user1, 123) is True
+    assert store2.is_trusted(bot1, 123) is True
+    assert store2.is_trusted(DummyAccount(999), 123) is False
 
-function getCurrentTrack(player) {
-  return player?.currentTrack ?? player?.queue?.currentTrack ?? null;
-}
 
-function safeHttpUrl(value) {
-  if (typeof value !== "string" || !value.trim()) return null;
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:" ? url.href : null;
-  } catch {
-    return null;
-  }
-}
+def test_trust_store_corrupt_file_handling(tmp_path: Path):
+    path = tmp_path / "trust.json"
+    path.write_text("{ invalid json ...", encoding="utf-8")
 
-function clipText(value, maxLength = MAX_TITLE_LENGTH) {
-  const text = String(value ?? "Không rõ tên").trim() || "Không rõ tên";
-  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
-}
+    store = TrustStore(path)
+    assert store.safe is False
+    assert store.ready is False
+    assert "Không đọc được trust file" in store.reason
+    
+    corrupt_files = list(tmp_path.glob("*.corrupt"))
+    assert len(corrupt_files) == 1
 
-function escapeMarkdown(value) {
-  return String(value ?? "").replace(/[\\`*_{}\[\]()<>#+\-.!|~]/g, "\\$&");
-}
 
-// ZiPlayer track durations are milliseconds (e.g. 300000 = 5 minutes).
-function formatDuration(durationMs) {
-  const value = Number(durationMs);
-  if (!Number.isFinite(value) || value <= 0) return "LIVE";
-
-  const totalSeconds = Math.floor(value / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  const pad = (number) => String(number).padStart(2, "0");
-
-  return hours > 0
-    ? `${hours}:${pad(minutes)}:${pad(seconds)}`
-    : `${minutes}:${pad(seconds)}`;
-}
-
-function resolveUserMention(requester, fallbackId) {
-  const pick = (value) => {
-    if (!value) return null;
-    if (typeof value === "string") return /^\d{17,20}$/.test(value) ? `<@${value}>` : null;
-    if (typeof value === "object") {
-      const id = value.id || value.userId || value.user?.id;
-      if (id && /^\d{17,20}$/.test(String(id))) return `<@${id}>`;
-      if (value.username) return `**${clipText(value.username, 80)}**`;
-    }
-    return null;
-  };
-  return pick(requester) || pick(fallbackId) || "Không xác định";
-}
-
-async function resolveQuery(query) {
-  const input = String(query ?? "").trim();
-  if (!input) return input;
-  if (!input.includes("on.soundcloud.com")) return input;
-
-  let timeoutId;
-  try {
-    const controller = new AbortController();
-    timeoutId = setTimeout(() => controller.abort(), 4_000);
-    const response = await fetch(input, {
-      method: "HEAD",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-    const resolvedUrl = safeHttpUrl(response.url);
-    return resolvedUrl && !resolvedUrl.includes("on.soundcloud.com") ? resolvedUrl : input;
-  } catch (error) {
-    console.warn("[SoundCloud resolve warning]", error?.message || error);
-    return input;
-  } finally {
-    if (timeoutId) clearTimeout(timeoutId);
-  }
-}
-
-function getAllQueueTracks(player) {
-  const queue = player?.queue;
-  if (!queue) return [];
-
-  if (typeof queue.toArray === "function") {
-    const tracks = queue.toArray();
-    if (Array.isArray(tracks)) return tracks;
-  }
-  if (Array.isArray(queue.tracks)) return queue.tracks;
-
-  const size = Number(queue.size) || 0;
-  if (typeof queue.getTrack === "function" && size > 0) {
-    const tracks = [];
-    for (let index = 0; index < size; index += 1) {
-      const track = queue.getTrack(index);
-      if (track) tracks.push(track);
-    }
-    return tracks;
-  }
-  return [];
-}
-
-function memberIsInPlayerVoice(member, player) {
-  const memberChannelId = member?.voice?.channelId;
-  const playerChannelId = player?.userdata?.voiceChannelId;
-  return Boolean(memberChannelId && playerChannelId && memberChannelId === playerChannelId);
-}
-
-async function requireSameVoiceForMessage(message, player) {
-  if (memberIsInPlayerVoice(message.member, player)) return true;
-  await message.reply("❌ Bạn cần ở cùng kênh thoại với bot để điều khiển nhạc.").catch(() => {});
-  return false;
-}
-
-async function requireSameVoiceForInteraction(interaction, player) {
-  if (memberIsInPlayerVoice(interaction.member, player)) return true;
-  await interaction.reply({
-    content: "❌ Bạn cần ở cùng kênh thoại với bot để điều khiển nhạc.",
-    flags: EPHEMERAL,
-  }).catch(() => {});
-  return false;
-}
-
-async function sendInteractionError(interaction, message) {
-  const payload = { content: message, flags: EPHEMERAL };
-  try {
-    if (interaction.isChatInputCommand?.() && interaction.deferred) {
-      await interaction.editReply({ content: message });
-    } else if (interaction.replied || interaction.deferred) {
-      await interaction.followUp(payload);
-    } else {
-      await interaction.reply(payload);
-    }
-  } catch {
-    // Interaction may have expired or already been acknowledged.
-  }
-}
-
-function getSafeErrorMessage(error) {
-  if (error?.message === "VOICE_CHANNEL_MISMATCH") {
-    return "❌ Bot đang phát ở kênh thoại khác. Hãy dùng bot trong cùng kênh với người đang nghe.";
-  }
-  return "❌ Có lỗi khi xử lý yêu cầu. Hãy thử lại sau.";
-}
-
-// --------------------------- Slash commands ---------------------------
-
-const commands = [
-  new SlashCommandBuilder()
-    .setName("play")
-    .setDescription("Phát nhạc từ YouTube, SoundCloud hoặc Spotify")
-    .addStringOption((option) =>
-      option
-        .setName("query")
-        .setDescription("Link hoặc tên bài hát")
-        .setRequired(true)
-        .setMaxLength(500),
-    ),
-  new SlashCommandBuilder().setName("skip").setDescription("Bỏ qua bài hát hiện tại"),
-  new SlashCommandBuilder()
-    .setName("skipto")
-    .setDescription("Phát bài ở vị trí đã chọn trong hàng chờ")
-    .addIntegerOption((option) =>
-      option
-        .setName("position")
-        .setDescription("Vị trí bài trong hàng chờ, bắt đầu từ 1")
-        .setRequired(true)
-        .setMinValue(1),
-    ),
-  new SlashCommandBuilder().setName("queue").setDescription("Xem danh sách hàng chờ"),
-  new SlashCommandBuilder().setName("stop").setDescription("Dừng nhạc và rời kênh thoại"),
-  new SlashCommandBuilder().setName("nowplaying").setDescription("Xem bài hát đang phát"),
-  new SlashCommandBuilder().setName("shuffle").setDescription("Trộn bài trong hàng chờ"),
-  new SlashCommandBuilder()
-    .setName("admin")
-    .setDescription("Hệ thống quản trị Admin")
-    .addSubcommand((sub) => sub.setName("stats").setDescription("Xem tài nguyên bot"))
-    .addSubcommand((sub) => sub.setName("clearqueue").setDescription("Xóa toàn bộ hàng chờ"))
-    .addSubcommand((sub) => sub.setName("forceleave").setDescription("Buộc bot dừng và rời phòng")),
-].map((command) => command.toJSON());
-
-// --------------------------- Player lifecycle ---------------------------
-
-async function getOrCreatePlayer({ guildId, textChannel, voiceChannel, userId }) {
-  let player = getPlayerForGuild(guildId);
-
-  if (
-    player?.userdata?.voiceChannelId &&
-    player.userdata.voiceChannelId !== voiceChannel.id
-  ) {
-    throw new Error("VOICE_CHANNEL_MISMATCH");
-  }
-
-  if (!player) {
-    player = await manager.create(guildId, {
-      leaveOnEnd: true,
-      leaveOnEmpty: true,
-      pauseOnEmpty: false,
-      selfDeaf: true,
-      volume: 80,
-      lowPerformance: true,
-      preload: { enabled: false },
-      crossfade: { enabled: false },
-      userdata: {
-        channel: textChannel,
-        lastRequesterId: userId,
-        voiceChannelId: voiceChannel.id,
-        paused: false,
-        suppressQueueEnd: false,
-      },
-    });
-  }
-
-  const userdata = ensureUserdata(player);
-  userdata.channel = textChannel;
-  userdata.lastRequesterId = userId;
-  userdata.voiceChannelId = voiceChannel.id;
-  if (typeof userdata.paused !== "boolean") userdata.paused = false;
-  if (typeof userdata.suppressQueueEnd !== "boolean") userdata.suppressQueueEnd = false;
-
-  if (!player.connection) {
-    await player.connect(voiceChannel);
-    userdata.voiceChannelId = voiceChannel.id;
-  }
-  return player;
-}
-
-async function enqueue({ guildId, textChannel, voiceChannel, userId, query }) {
-  const finalQuery = await resolveQuery(query);
-  if (!finalQuery) return false;
-
-  const player = await getOrCreatePlayer({ guildId, textChannel, voiceChannel, userId });
-  // Some ZiPlayer versions return undefined on success. Only an explicit false
-  // is considered a failed result; thrown errors are handled by the caller.
-  const result = await player.play(finalQuery, userId);
-  return result !== false;
-}
-
-async function clearControls(player) {
-  const userdata = player?.userdata;
-  const message = userdata?.controlMessage;
-  if (!message) return;
-
-  await message.edit({ components: [] }).catch(() => {});
-  userdata.controlMessage = null;
-}
-
-async function stopAndLeave(player) {
-  if (!player) return;
-  const userdata = ensureUserdata(player);
-  // Prevent stop-triggered queueEnd events from claiming the queue finished normally.
-  userdata.suppressQueueEnd = true;
-  await clearControls(player);
-
-  try {
-    if (typeof player.queue?.clear === "function") player.queue.clear();
-    if (typeof player.stop === "function") await player.stop();
-  } finally {
-    if (typeof player.destroy === "function") await player.destroy();
-  }
-}
-
-async function skipToPosition(player, position) {
-  const tracks = getAllQueueTracks(player);
-  if (!Number.isInteger(position) || position < 1 || position > tracks.length) return false;
-  if (typeof player.queue?.remove !== "function" || typeof player.skip !== "function") return false;
-  if (!getCurrentTrack(player)) return false;
-
-  // Queue positions are 1-based in the UI. Remove tracks before the target,
-  // then skip the current track so the selected item becomes the next one.
-  for (let index = 1; index < position; index += 1) {
-    player.queue.remove(0);
-  }
-  await player.skip();
-  return true;
-}
-
-// --------------------------- Queue UI ---------------------------
-
-function createMusicControls() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("music_pause")
-      .setLabel("⏯ Tạm dừng / Tiếp tục")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("music_skip")
-      .setLabel("⏭ Bỏ qua")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId("music_queue")
-      .setLabel("📜 Hàng chờ")
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId("music_stop")
-      .setLabel("⏹ Dừng")
-      .setStyle(ButtonStyle.Danger),
-  );
-}
-
-function buildNowPlayingEmbed(player, track = getCurrentTrack(player)) {
-  if (!track) {
-    return new EmbedBuilder()
-      .setColor("#2b2d31")
-      .setTitle("🎵 Hiện không có bài hát nào đang phát.");
-  }
-
-  const url = safeHttpUrl(track.url);
-  const description = [
-    `**${escapeMarkdown(clipText(track.title))}**`,
-    url ? `<${url}>` : null,
-  ].filter(Boolean).join("\n");
-
-  const embed = new EmbedBuilder()
-    .setColor("#5865F2")
-    .setTitle("🎵 Đang phát")
-    .setDescription(description)
-    .addFields(
-      { name: "⏱️ Thời lượng", value: formatDuration(track.duration), inline: true },
-      { name: "🔊 Âm lượng", value: `${player.volume ?? 80}%`, inline: true },
-      {
-        name: "👤 Yêu cầu bởi",
-        value: resolveUserMention(track.requestedBy, player.userdata?.lastRequesterId),
-        inline: true,
-      },
-    )
-    .setFooter({ text: "Nexora Music VIP" });
-
-  const thumbnail = safeHttpUrl(track.thumbnail);
-  if (thumbnail) embed.setThumbnail(thumbnail);
-  return embed;
-}
-
-function buildQueuePage(player, page = 1, pageSize = QUEUE_PAGE_SIZE) {
-  const tracks = getAllQueueTracks(player);
-  const totalPages = Math.max(1, Math.ceil(tracks.length / pageSize));
-  const currentPage = Math.max(1, Math.min(Math.floor(Number(page) || 1), totalPages));
-  const startIndex = (currentPage - 1) * pageSize;
-  const pageTracks = tracks.slice(startIndex, startIndex + pageSize);
-  const current = getCurrentTrack(player);
-
-  let description = current
-    ? `**Đang phát:** ${escapeMarkdown(clipText(current.title, 220))}\n\n`
-    : "**Đang phát:** Không có\n\n";
-
-  if (pageTracks.length === 0) {
-    description += "*Hàng chờ trống.*";
-  } else {
-    for (let index = 0; index < pageTracks.length; index += 1) {
-      const track = pageTracks[index];
-      const queuePosition = startIndex + index + 1;
-      const title = escapeMarkdown(clipText(track.title, 180));
-      const url = safeHttpUrl(track.url);
-      description += `${queuePosition}. \`${formatDuration(track.duration)}\` ${title}`;
-      if (url) description += ` — <${url}>`;
-      description += "\n";
-    }
-  }
-
-  const embed = new EmbedBuilder()
-    .setColor("#2b2d31")
-    .setTitle(`📜 Hàng chờ · Trang ${currentPage}/${totalPages}`)
-    .setDescription(description.slice(0, 4000))
-    .setFooter({ text: `${tracks.length} bài trong hàng chờ · Chọn bài để phát tiếp theo` });
-
-  const navigationButtons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`q_first_${currentPage}`)
-      .setLabel("≪")
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(currentPage === 1),
-    new ButtonBuilder()
-      .setCustomId(`q_prev_${currentPage}`)
-      .setLabel("‹")
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(currentPage === 1),
-    new ButtonBuilder()
-      .setCustomId(`q_next_${currentPage}`)
-      .setLabel("›")
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(currentPage === totalPages),
-    new ButtonBuilder()
-      .setCustomId(`q_last_${currentPage}`)
-      .setLabel("≫")
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(currentPage === totalPages),
-  );
-
-  const components = [navigationButtons];
-
-  if (pageTracks.length > 0) {
-    const trackMenu = new StringSelectMenuBuilder()
-      .setCustomId("q_play_track_menu")
-      .setPlaceholder("🎵 Chọn bài muốn phát tiếp theo")
-      .addOptions(
-        pageTracks.map((track, index) => {
-          const position = startIndex + index + 1;
-          const labelTitle = clipText(track.title, 85);
-          return new StringSelectMenuOptionBuilder()
-            .setLabel(clipText(`${position}. ${labelTitle}`, 100))
-            .setValue(`trackpos_${position}`)
-            .setDescription(`Thời lượng: ${formatDuration(track.duration)}`);
+def test_trust_store_rejects_unsupported_schema(tmp_path: Path):
+    """Kiểm tra TrustStore phải từ chối các schema_version lạ/không tương thích."""
+    path = tmp_path / "trust.json"
+    path.write_text(
+        json.dumps({
+            "schema_version": 999,
+            "guilds": {
+                "123": {"users": [456], "bots": []}
+            },
         }),
-      );
-    components.push(new ActionRowBuilder().addComponents(trackMenu));
-  }
+        encoding="utf-8",
+    )
 
-  // A Discord select menu can contain at most 25 options. Center the visible
-  // window around the current page so long queues remain navigable.
-  if (totalPages > 1) {
-    const firstVisiblePage = Math.max(1, Math.min(currentPage - 12, totalPages - 24));
-    const lastVisiblePage = Math.min(totalPages, firstVisiblePage + 24);
-    const pageOptions = [];
+    store = TrustStore(path)
+    assert store.safe is False
+    assert store.ready is False
 
-    for (let pageNumber = firstVisiblePage; pageNumber <= lastVisiblePage; pageNumber += 1) {
-      pageOptions.push(
-        new StringSelectMenuOptionBuilder()
-          .setLabel(`Trang ${pageNumber}`)
-          .setValue(`page_${pageNumber}`)
-          .setDefault(pageNumber === currentPage),
-      );
-    }
 
-    const pageMenu = new StringSelectMenuBuilder()
-      .setCustomId("q_jump_menu")
-      .setPlaceholder("Chuyển nhanh đến trang…")
-      .addOptions(pageOptions);
-    components.push(new ActionRowBuilder().addComponents(pageMenu));
-  }
+def test_trust_store_legacy_schema_migration(tmp_path: Path):
+    path = tmp_path / "trust.json"
+    legacy_data = {"users": [123, 456], "bots": [789]}
+    path.write_text(json.dumps(legacy_data), encoding="utf-8")
 
-  return { embeds: [embed], components };
-}
+    store = TrustStore(path)
+    assert store.safe is False
+    assert store.legacy_backup is not None
+    assert store.legacy_backup.exists()
 
-// --------------------------- ZiPlayer events ---------------------------
+    imported_users, imported_bots = store.import_legacy_for_guild(9999)
+    assert imported_users == 2
+    assert imported_bots == 1
+    assert store.safe is True
+    assert store.ready is True
+    assert store.is_trusted(DummyAccount(123), 9999) is True
 
-manager.on("trackStart", async (player, track) => {
-  const channel = player?.userdata?.channel;
-  if (!channel?.send) return;
 
-  try {
-    await clearControls(player);
-    const embed = buildNowPlayingEmbed(player, track);
-    const message = await channel.send({ embeds: [embed], components: [createMusicControls()] });
-    ensureUserdata(player).controlMessage = message;
-    ensureUserdata(player).paused = false;
-  } catch (error) {
-    console.error("[trackStart error]", error);
-  }
-});
+def test_trust_store_write_failure_rollback(tmp_path: Path, monkeypatch):
+    path = tmp_path / "trust.json"
+    store = TrustStore(path)
+    store.init_empty()
 
-manager.on("queueEnd", async (player) => {
-  if (player?.userdata?.suppressQueueEnd) return;
-  await clearControls(player);
-  const channel = player?.userdata?.channel;
-  if (channel?.send) {
-    await channel.send("✅ Đã phát xong danh sách chờ!").catch(() => {});
-  }
-});
+    user = DummyAccount(555)
+    
+    def mock_replace(src, dst):
+        raise OSError("Disk full / permission denied")
 
-manager.on("playerPause", (player) => {
-  ensureUserdata(player).paused = true;
-});
+    monkeypatch.setattr(os, "replace", mock_replace)
 
-manager.on("playerResume", (player) => {
-  ensureUserdata(player).paused = false;
-});
+    with pytest.raises(TrustStoreError):
+        store.add(123, user)
 
-manager.on("playerError", (player, error, track) => {
-  console.error("[ZiPlayer error]", error);
-  const channel = player?.userdata?.channel;
-  if (channel?.send) {
-    const title = track?.title ? ` (${clipText(track.title, 80)})` : "";
-    channel.send(`⚠️ Có lỗi khi phát nhạc${title}. Hãy thử lại hoặc chọn bài khác.`).catch(() => {});
-  }
-});
+    assert user.id not in store.guild(123)["users"]
 
-// --------------------------- Prefix commands ---------------------------
 
-async function handlePrefixCommand(message) {
-  if (message.author.bot || !message.guild || !message.content.startsWith(PREFIX)) return;
+def test_trust_store_legacy_import_write_failure_preserves_state(tmp_path: Path, monkeypatch):
+    """Kiểm tra khi import legacy mà ghi đĩa thất bại, nội dung bản sao và trạng thái an toàn phải được giữ nguyên."""
+    path = tmp_path / "trust.json"
+    legacy_data = {"users": [123, 456], "bots": [789]}
+    path.write_text(json.dumps(legacy_data), encoding="utf-8")
 
-  const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
-  const command = (args.shift() || "").toLowerCase();
-  if (!command) return;
+    store = TrustStore(path)
+    assert store.safe is False
+    assert store.legacy_backup is not None
+    backup_content_before = store.legacy_backup.read_text(encoding="utf-8")
 
-  const voiceChannel = message.member?.voice?.channel;
+    def mock_replace(src, dst):
+        raise OSError("Disk write failed during import")
 
-  try {
-    if (["play", "p"].includes(command)) {
-      if (!voiceChannel) return message.reply("❌ Bạn cần vào kênh thoại trước khi phát nhạc.");
-      const query = args.join(" ").trim();
-      if (!query) return message.reply(`❌ Cách dùng: \`${PREFIX}play tên bài hát hoặc link\``);
+    monkeypatch.setattr(os, "replace", mock_replace)
 
-      const ok = await enqueue({
-        guildId: message.guild.id,
-        textChannel: message.channel,
-        voiceChannel,
-        userId: message.author.id,
-        query,
-      });
-      return message.reply(ok ? "🔍 Đã thêm yêu cầu vào trình phát!" : "❌ Không tìm thấy bài hát phù hợp.");
-    }
+    with pytest.raises(TrustStoreError):
+        store.import_legacy_for_guild(9999)
 
-    if (["queue", "q"].includes(command)) {
-      const player = getPlayerForGuild(message.guild.id);
-      if (!player) return message.reply("🎶 Hàng chờ đang trống.");
-      return message.reply(buildQueuePage(player, 1));
-    }
+    assert store.safe is False
+    assert store.legacy_backup.exists()
+    assert store.legacy_backup.read_text(encoding="utf-8") == backup_content_before
 
-    if (["nowplaying", "np"].includes(command)) {
-      const player = getPlayerForGuild(message.guild.id);
-      if (!player || !getCurrentTrack(player)) return message.reply("🎶 Hiện không có bài hát nào đang phát.");
-      return message.reply({ embeds: [buildNowPlayingEmbed(player)] });
-    }
 
-    if (["skip", "s"].includes(command)) {
-      const player = getPlayerForGuild(message.guild.id);
-      if (!player || !getCurrentTrack(player)) return message.reply("❌ Không có bài hát đang phát.");
-      if (!(await requireSameVoiceForMessage(message, player))) return;
-      await player.skip();
-      return message.reply("⏭️ Đã chuyển bài!");
-    }
+# ============================================================================
+# 2. TEST ACTION TRACKER (Single, Total Threshold & Biên thời gian)
+# ============================================================================
 
-    if (command === "skipto") {
-      const player = getPlayerForGuild(message.guild.id);
-      if (!player || !getCurrentTrack(player)) return message.reply("❌ Hàng chờ đang trống.");
-      if (!(await requireSameVoiceForMessage(message, player))) return;
-      const position = Number.parseInt(args[0], 10);
-      if (!Number.isInteger(position) || position < 1) return message.reply("❌ Vui lòng nhập số thứ tự hợp lệ.");
-      const success = await skipToPosition(player, position);
-      if (!success) return message.reply("❌ Vị trí không tồn tại trong hàng chờ.");
-      return message.reply(`⏩ Đã chuyển đến bài số **${position}** trong hàng chờ.`);
-    }
+def test_action_tracker_single_and_total():
+    thresholds = {"ban": 3, "kick": 2}
+    tracker = ActionTracker(
+        window=10.0,
+        thresholds=thresholds,
+        total_actions={"ban", "kick"},
+        total_threshold=4,
+    )
 
-    if (command === "shuffle") {
-      const player = getPlayerForGuild(message.guild.id);
-      if (!player || getAllQueueTracks(player).length < 2) return message.reply("❌ Cần ít nhất 2 bài trong hàng chờ để trộn.");
-      if (!(await requireSameVoiceForMessage(message, player))) return;
-      if (typeof player.shuffle === "function") await player.shuffle();
-      else if (typeof player.queue?.shuffle === "function") await player.queue.shuffle();
-      else return message.reply("❌ Trình phát hiện không hỗ trợ trộn hàng chờ.");
-      return message.reply("🔀 Đã trộn hàng chờ!");
-    }
+    now = 100.0
+    guild_id, actor_id = 1, 999
 
-    if (command === "stop") {
-      const player = getPlayerForGuild(message.guild.id);
-      if (!player) return message.reply("❌ Bot hiện không phát nhạc.");
-      if (!(await requireSameVoiceForMessage(message, player))) return;
-      await stopAndLeave(player);
-      return message.reply("⏹️ Đã dừng nhạc và rời kênh thoại.");
-    }
+    trg1 = tracker.record(guild_id, actor_id, "ban", now)
+    assert not trg1.fired
+    assert trg1.single_count == 1
 
-    if (["admin", "stats", "clear", "leave"].includes(command)) {
-      if (!isAdmin(message.author.id)) {
-        return message.reply("⛔ Bạn không có quyền sử dụng lệnh Admin.");
-      }
+    tracker.record(guild_id, actor_id, "ban", now + 1)
+    trg3 = tracker.record(guild_id, actor_id, "ban", now + 2)
+    assert trg3.fired is True
+    assert "ban: 3 lần" in trg3.reasons[0]
 
-      const subcommand = command === "admin" ? (args[0] || "").toLowerCase() : command;
-      if (subcommand === "stats") {
-        const memory = process.memoryUsage();
-        const formatMb = (bytes) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-        const stats = typeof manager.getStats === "function" ? manager.getStats() : {};
-        const uptime = Math.floor(process.uptime());
-        const embed = new EmbedBuilder()
-          .setColor("#FFD700")
-          .setTitle("📊 Thông số NEXORA MUSIC VIP")
-          .addFields(
-            { name: "RAM tiến trình (RSS)", value: formatMb(memory.rss), inline: true },
-            { name: "Heap đang dùng", value: formatMb(memory.heapUsed), inline: true },
-            { name: "Uptime", value: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${uptime % 60}s`, inline: true },
-            { name: "Node.js", value: process.version, inline: true },
-            { name: "Discord servers", value: String(client.guilds.cache.size), inline: true },
-            { name: "Player đang quản lý", value: String(stats?.totalPlayers ?? "N/A"), inline: true },
-          );
-        return message.reply({ embeds: [embed] });
-      }
 
-      if (["clearqueue", "clear"].includes(subcommand)) {
-        const player = getPlayerForGuild(message.guild.id);
-        if (!player) return message.reply("❌ Bot không có trình phát trong máy chủ này.");
-        if (typeof player.queue?.clear === "function") player.queue.clear();
-        return message.reply("🧹 Đã xóa toàn bộ hàng chờ. Bài đang phát (nếu có) sẽ không bị dừng.");
-      }
+def test_action_tracker_total_threshold():
+    """Kiểm tra hành vi gộp nhiều hành động khác nhau dưới ngưỡng đơn nhưng chạm ngưỡng tổng."""
+    tracker = ActionTracker(
+        window=10.0,
+        thresholds={"ban": 10, "kick": 10},
+        total_actions={"ban", "kick"},
+        total_threshold=4,
+    )
 
-      if (["forceleave", "leave"].includes(subcommand)) {
-        const player = getPlayerForGuild(message.guild.id);
-        if (!player) return message.reply("❌ Bot hiện không ở trong kênh thoại.");
-        await stopAndLeave(player);
-        return message.reply("🛑 [ADMIN] Đã buộc bot dừng và rời kênh thoại.");
-      }
-    }
-  } catch (error) {
-    console.error(`[Prefix command error: ${command}]`, error);
-    await message.reply(getSafeErrorMessage(error)).catch(() => {});
-  }
-}
+    now = 100.0
+    for i in range(3):
+        result = tracker.record(1, 999, "ban", now + i)
+        assert result.fired is False
 
-client.on("messageCreate", handlePrefixCommand);
+    result = tracker.record(1, 999, "kick", now + 3)
+    assert result.fired is True
+    assert any("Tổng hành động nguy hiểm" in r for r in result.reasons)
 
-// --------------------------- Slash interactions ---------------------------
 
-async function handleSlashCommand(interaction) {
-  const { commandName } = interaction;
-  const voiceChannel = interaction.member?.voice?.channel;
+def test_action_tracker_time_boundary():
+    tracker = ActionTracker(window=5.0, thresholds={"spam_action": 2})
+    guild, actor = 1, 100
+    now = 1000.0
 
-  if (commandName === "play") {
-    if (!voiceChannel) {
-      return interaction.reply({ content: "❌ Bạn cần vào kênh thoại trước khi phát nhạc.", flags: EPHEMERAL });
-    }
+    tracker.record(guild, actor, "spam_action", now)
+    trg = tracker.record(guild, actor, "spam_action", now + 4.9)
+    assert trg.fired is True
 
-    await interaction.deferReply();
-    const ok = await enqueue({
-      guildId: interaction.guildId,
-      textChannel: interaction.channel,
-      voiceChannel,
-      userId: interaction.user.id,
-      query: interaction.options.getString("query", true),
-    });
-    return interaction.editReply(ok ? "🔍 Đã thêm yêu cầu vào trình phát!" : "❌ Không tìm thấy bài hát phù hợp.");
-  }
+    tracker.record(guild, actor, "spam_action", now + 10.0)
+    trg_boundary = tracker.record(guild, actor, "spam_action", now + 14.5)
+    assert trg_boundary.single_count == 2
+    assert trg_boundary.fired is False
 
-  if (commandName === "queue") {
-    const player = getPlayerForGuild(interaction.guildId);
-    if (!player) return interaction.reply({ content: "🎶 Hàng chờ đang trống.", flags: EPHEMERAL });
-    return interaction.reply({ ...buildQueuePage(player, 1), flags: EPHEMERAL });
-  }
 
-  if (commandName === "nowplaying") {
-    const player = getPlayerForGuild(interaction.guildId);
-    if (!player || !getCurrentTrack(player)) {
-      return interaction.reply({ content: "🎶 Hiện không có bài hát nào đang phát.", flags: EPHEMERAL });
-    }
-    return interaction.reply({ embeds: [buildNowPlayingEmbed(player)], flags: EPHEMERAL });
-  }
+def test_action_tracker_trusted_multiplier():
+    tracker = ActionTracker(
+        window=10.0,
+        thresholds={"purge": 2},
+        trusted_multiplier=3,
+    )
+    guild_id, actor_id = 1, 888
+    now = 300.0
 
-  if (commandName === "skip") {
-    const player = getPlayerForGuild(interaction.guildId);
-    if (!player || !getCurrentTrack(player)) {
-      return interaction.reply({ content: "❌ Không có bài hát đang phát.", flags: EPHEMERAL });
-    }
-    if (!(await requireSameVoiceForInteraction(interaction, player))) return;
-    await player.skip();
-    return interaction.reply({ content: "⏭️ Đã chuyển bài!", flags: EPHEMERAL });
-  }
+    assert not tracker.record(guild_id, actor_id, "purge", now, trusted=False).fired
+    assert tracker.record(guild_id, actor_id, "purge", now + 1, trusted=False).fired is True
 
-  if (commandName === "skipto") {
-    const player = getPlayerForGuild(interaction.guildId);
-    if (!player || !getCurrentTrack(player)) {
-      return interaction.reply({ content: "❌ Hàng chờ đang trống.", flags: EPHEMERAL });
-    }
-    if (!(await requireSameVoiceForInteraction(interaction, player))) return;
-    const position = interaction.options.getInteger("position", true);
-    const success = await skipToPosition(player, position);
-    if (!success) {
-      return interaction.reply({ content: "❌ Vị trí không tồn tại trong hàng chờ.", flags: EPHEMERAL });
-    }
-    return interaction.reply({ content: `⏩ Đã chuyển đến bài số **${position}** trong hàng chờ.`, flags: EPHEMERAL });
-  }
+    for i in range(5):
+        trg = tracker.record(guild_id, actor_id + 1, "purge", now + i, trusted=True)
+        assert not trg.fired
+    
+    trg_final = tracker.record(guild_id, actor_id + 1, "purge", now + 6, trusted=True)
+    assert trg_final.fired is True
 
-  if (commandName === "shuffle") {
-    const player = getPlayerForGuild(interaction.guildId);
-    if (!player || getAllQueueTracks(player).length < 2) {
-      return interaction.reply({ content: "❌ Cần ít nhất 2 bài trong hàng chờ để trộn.", flags: EPHEMERAL });
-    }
-    if (!(await requireSameVoiceForInteraction(interaction, player))) return;
-    if (typeof player.shuffle === "function") await player.shuffle();
-    else if (typeof player.queue?.shuffle === "function") await player.queue.shuffle();
-    else return interaction.reply({ content: "❌ Trình phát hiện không hỗ trợ trộn hàng chờ.", flags: EPHEMERAL });
-    return interaction.reply({ content: "🔀 Đã trộn hàng chờ!", flags: EPHEMERAL });
-  }
 
-  if (commandName === "stop") {
-    const player = getPlayerForGuild(interaction.guildId);
-    if (!player) return interaction.reply({ content: "❌ Bot hiện không phát nhạc.", flags: EPHEMERAL });
-    if (!(await requireSameVoiceForInteraction(interaction, player))) return;
-    await stopAndLeave(player);
-    return interaction.reply({ content: "⏹️ Đã dừng nhạc và rời kênh thoại.", flags: EPHEMERAL });
-  }
+# ============================================================================
+# 3. TEST SPAM TRACKER & CHUNKING (Cửa sổ thời gian & Trùng lặp)
+# ============================================================================
 
-  if (commandName === "admin") {
-    if (!isAdmin(interaction.user.id)) {
-      return interaction.reply({ content: "⛔ Bạn không có quyền Admin.", flags: EPHEMERAL });
-    }
+def test_spam_tracker_window():
+    spam = SpamTracker(max_messages=2, window=5.0)
+    now = 1000.0
 
-    const subcommand = interaction.options.getSubcommand();
-    if (subcommand === "stats") {
-      const memory = process.memoryUsage();
-      const formatMb = (bytes) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-      const stats = typeof manager.getStats === "function" ? manager.getStats() : {};
-      const uptime = Math.floor(process.uptime());
-      const embed = new EmbedBuilder()
-        .setColor("#FFD700")
-        .setTitle("📊 Thông số NEXORA MUSIC VIP")
-        .addFields(
-          { name: "RAM tiến trình (RSS)", value: formatMb(memory.rss), inline: true },
-          { name: "Heap đang dùng", value: formatMb(memory.heapUsed), inline: true },
-          { name: "Uptime", value: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${uptime % 60}s`, inline: true },
-          { name: "Node.js", value: process.version, inline: true },
-          { name: "Discord servers", value: String(client.guilds.cache.size), inline: true },
-          { name: "Player đang quản lý", value: String(stats?.totalPlayers ?? "N/A"), inline: true },
-        );
-      return interaction.reply({ embeds: [embed], flags: EPHEMERAL });
-    }
+    assert spam.record("user1", now, "msg1", channel_id=50) is False
+    assert spam.record("user1", now + 1, "msg2", channel_id=50) is False
+    assert spam.record("user1", now + 2, "msg3", channel_id=50) is True
 
-    if (subcommand === "clearqueue") {
-      const player = getPlayerForGuild(interaction.guildId);
-      if (!player) return interaction.reply({ content: "❌ Không có trình phát trong máy chủ này.", flags: EPHEMERAL });
-      if (typeof player.queue?.clear === "function") player.queue.clear();
-      return interaction.reply({ content: "🧹 Đã xóa toàn bộ hàng chờ. Bài đang phát (nếu có) sẽ không bị dừng.", flags: EPHEMERAL });
-    }
+    items = spam.take("user1")
+    assert len(items) == 3
+    assert spam.take("user1") == []
 
-    if (subcommand === "forceleave") {
-      const player = getPlayerForGuild(interaction.guildId);
-      if (!player) return interaction.reply({ content: "❌ Bot hiện không ở trong kênh thoại.", flags: EPHEMERAL });
-      await stopAndLeave(player);
-      return interaction.reply({ content: "🛑 Đã buộc bot dừng và rời kênh thoại.", flags: EPHEMERAL });
-    }
-  }
-}
 
-async function handleComponentInteraction(interaction) {
-  const isButton = interaction.isButton();
-  const isSelectMenu = interaction.isStringSelectMenu();
-  if (!isButton && !isSelectMenu) return;
+def test_spam_tracker_time_window_expiry():
+    """Kiểm tra tin nhắn cũ tự động hết hạn ngoài cửa sổ, tránh phạt nhầm người chat bình thường."""
+    spam = SpamTracker(max_messages=2, window=5.0)
+    now = 1000.0
 
-  const customId = interaction.customId;
-  if (!customId.startsWith("q_") && !customId.startsWith("music_")) return;
+    assert spam.record("user1", now, "msg1", channel_id=50) is False
+    assert spam.record("user1", now + 1, "msg2", channel_id=50) is False
 
-  const player = getPlayerForGuild(interaction.guildId);
-  if (!player) {
-    return interaction.reply({ content: "❌ Bot hiện không có trình phát trong máy chủ này.", flags: EPHEMERAL });
-  }
+    # Sau 6 giây (vượt quá window 5.0), 2 tin nhắn cũ đã trôi qua.
+    assert spam.record("user1", now + 6.0, "msg3", channel_id=50) is False
 
-  if (isSelectMenu && customId === "q_play_track_menu") {
-    if (!(await requireSameVoiceForInteraction(interaction, player))) return;
-    const targetPosition = Number.parseInt(interaction.values[0]?.split("_")[1], 10);
-    await interaction.deferReply({ flags: EPHEMERAL });
-    const success = await skipToPosition(player, targetPosition);
-    return interaction.editReply(
-      success
-        ? `⏩ Đã chọn bài số **${targetPosition}** để phát tiếp theo.`
-        : "❌ Vị trí không còn tồn tại trong hàng chờ. Hãy mở lại hàng chờ rồi chọn lại.",
-    );
-  }
 
-  if (isSelectMenu && customId === "q_jump_menu") {
-    const targetPage = Number.parseInt(interaction.values[0]?.split("_")[1], 10) || 1;
-    return interaction.update(buildQueuePage(player, targetPage));
-  }
+def test_group_by_channel_and_chunked():
+    shared = object()
+    other = object()
 
-  if (isButton && customId.startsWith("q_")) {
-    const [, action, pageText] = customId.split("_");
-    let page = Number.parseInt(pageText, 10) || 1;
-    const totalPages = Math.max(1, Math.ceil(getAllQueueTracks(player).length / QUEUE_PAGE_SIZE));
+    entries = [
+        (10, shared),
+        (10, other),
+        (20, object()),
+        (10, shared),
+    ]
 
-    if (action === "first") page = 1;
-    else if (action === "prev") page = Math.max(1, page - 1);
-    else if (action === "next") page = Math.min(totalPages, page + 1);
-    else if (action === "last") page = totalPages;
-    else return;
+    grouped = group_by_channel(entries)
+    
+    assert len(grouped[10]) == 2
+    assert len(grouped[20]) == 1
+    assert grouped[10][0] is shared
+    assert grouped[10][1] is other
 
-    return interaction.update(buildQueuePage(player, page));
-  }
+    assert chunked([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]
+    assert chunked([], 2) == []
 
-  if (isButton && customId.startsWith("music_")) {
-    if (customId === "music_queue") {
-      return interaction.reply({ ...buildQueuePage(player, 1), flags: EPHEMERAL });
-    }
 
-    if (!["music_pause", "music_skip", "music_stop"].includes(customId)) return;
-    if (!(await requireSameVoiceForInteraction(interaction, player))) return;
-    if (customId !== "music_stop" && !getCurrentTrack(player)) {
-      return interaction.reply({ content: "❌ Hiện không có bài hát đang phát.", flags: EPHEMERAL });
-    }
+# ============================================================================
+# 4. TEST COOLDOWNS & POLICY DECISIONS
+# ============================================================================
 
-    await interaction.deferUpdate();
-    const userdata = ensureUserdata(player);
+def test_cooldowns_logic():
+    cd = Cooldowns()
+    now = 500.0
 
-    if (customId === "music_pause") {
-      if (userdata.paused) {
-        await player.resume();
-        userdata.paused = false;
-      } else {
-        await player.pause();
-        userdata.paused = true;
-      }
-    } else if (customId === "music_skip") {
-      await player.skip();
-    } else if (customId === "music_stop") {
-      await stopAndLeave(player);
-    }
-  }
-}
+    assert cd.active("key1", now) is False
+    assert cd.try_acquire("key1", now, seconds=10) is True
+    assert cd.active("key1", now + 5) is True
+    assert cd.try_acquire("key1", now + 5, seconds=10) is False
 
-client.on("interactionCreate", async (interaction) => {
-  if (!interaction.inGuild()) return;
+    assert cd.active("key1", now + 10) is False
+    assert cd.try_acquire("key1", now + 10, seconds=10) is True
 
-  try {
-    if (interaction.isChatInputCommand()) {
-      await handleSlashCommand(interaction);
-      return;
-    }
-    await handleComponentInteraction(interaction);
-  } catch (error) {
-    console.error("[Interaction error]", error);
-    await sendInteractionError(interaction, getSafeErrorMessage(error));
-  }
-});
+    cd.block("key2", now, seconds=0)
+    assert cd.active("key2", now) is False
 
-// --------------------------- Startup ---------------------------
 
-client.once(Events.ClientReady, async (readyClient) => {
-  console.log(`✅ NEXORA MUSIC VIP ready: ${readyClient.user.tag}`);
+def test_decide_response_matrix():
+    assert decide_response(actor_is_owner=False, actor_trusted=False, trust_ready=False, defense_enabled=True, alert_only_action=False) == Response.ALERT_LOCKED
+    assert decide_response(actor_is_owner=True, actor_trusted=False, trust_ready=False, defense_enabled=True, alert_only_action=False) == Response.ALERT_OWNER
+    
+    assert decide_response(actor_is_owner=True, actor_trusted=False, trust_ready=True, defense_enabled=True, alert_only_action=False) == Response.ALERT_OWNER
+    assert decide_response(actor_is_owner=False, actor_trusted=True, trust_ready=True, defense_enabled=True, alert_only_action=False) == Response.ALERT_TRUSTED
+    assert decide_response(actor_is_owner=False, actor_trusted=False, trust_ready=True, defense_enabled=False, alert_only_action=False) == Response.ALERT_ONLY
+    assert decide_response(actor_is_owner=False, actor_trusted=False, trust_ready=True, defense_enabled=True, alert_only_action=True) == Response.ALERT_ONLY
+    assert decide_response(actor_is_owner=False, actor_trusted=False, trust_ready=True, defense_enabled=True, alert_only_action=False) == Response.DEFEND
 
-  try {
-    const rest = new REST({ version: "10" }).setToken(TOKEN);
-    await rest.put(Routes.applicationCommands(readyClient.user.id), { body: commands });
-    console.log("🚀 Slash commands registered.");
-  } catch (error) {
-    console.error("❌ Could not register slash commands:", error);
-  }
-});
 
-client.on("error", (error) => {
-  console.error("[Discord client error]", error);
-});
+def test_decide_bot_add():
+    assert decide_bot_add(actor_is_owner=False, actor_trusted=False, target_trusted=True, trust_ready=True, defense_enabled=True, kick_enabled=True) == BotAddDecision.TRUSTED_BOT
+    assert decide_bot_add(actor_is_owner=True, actor_trusted=False, target_trusted=False, trust_ready=True, defense_enabled=True, kick_enabled=True) == BotAddDecision.ALERT_ONLY
+    assert decide_bot_add(actor_is_owner=False, actor_trusted=False, target_trusted=False, trust_ready=False, defense_enabled=True, kick_enabled=True) == BotAddDecision.ALERT_LOCKED
+    assert decide_bot_add(actor_is_owner=False, actor_trusted=False, target_trusted=False, trust_ready=True, defense_enabled=True, kick_enabled=True) == BotAddDecision.KICK
 
-if (!TOKEN) {
-  console.error("❌ Missing DISCORD_TOKEN. Add it to your hosting environment or .env file.");
-  process.exitCode = 1;
-  if (webServer.listening) webServer.close();
-  else webServer.once("listening", () => webServer.close());
-} else {
-  client.login(TOKEN).catch((error) => {
-    console.error("❌ Discord login failed:", error);
-    process.exitCode = 1;
-    client.destroy();
-    webServer.close();
-  });
-}
+
+# ============================================================================
+# 5. TEST ROLE PLANNING & UTILS
+# ============================================================================
+
+def test_role_planning():
+    roles = [
+        RoleInfo(id=1, name="Admin", position=10, managed=False, dangerous=True),
+        RoleInfo(id=2, name="Default Dangerous Role", position=1, managed=False, dangerous=True, default=True),
+        RoleInfo(id=3, name="Bot Integration", position=15, managed=True, dangerous=True),
+        RoleInfo(id=4, name="High Role", position=50, managed=False, dangerous=True),
+        RoleInfo(id=5, name="Normal Safe", position=5, managed=False, dangerous=False),
+    ]
+    
+    bot_top_position = 20
+    plan = plan_role_removal(roles, bot_top_position)
+
+    assert len(plan.removable) == 1
+    assert plan.removable[0].name == "Admin"
+    assert not any(r.id == 2 for r in plan.removable)
+    assert len(plan.blocked_managed) == 1
+    assert plan.blocked_managed[0].name == "Bot Integration"
+    assert len(plan.blocked_hierarchy) == 1
+    assert plan.blocked_hierarchy[0].name == "High Role"
+
+    assert remove_roles_error_means_actor_gone(UNKNOWN_MEMBER_CODE) is True
